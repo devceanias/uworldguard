@@ -66,6 +66,7 @@ public final class MovementListener implements Listener {
     private final ChatTags chatTags;
     private final PendingRestores restores;
     private final Map<UUID, GameMode> savedGameModes = new ConcurrentHashMap<>();
+    private final Map<UUID, GameMode> appliedGameModes = new ConcurrentHashMap<>();
     private final Map<UUID, Float> savedWalkSpeed = new ConcurrentHashMap<>();
     private final Map<UUID, Float> savedFlySpeed = new ConcurrentHashMap<>();
     private final Map<UUID, Boolean> savedAllowFlight = new ConcurrentHashMap<>();
@@ -251,6 +252,7 @@ public final class MovementListener implements Listener {
             restores.forget(uuid);
         }
         savedGameModes.clear();
+        appliedGameModes.clear();
         savedWalkSpeed.clear();
         savedFlySpeed.clear();
         savedAllowFlight.clear();
@@ -936,8 +938,8 @@ public final class MovementListener implements Listener {
     }
 
     /**
-     * Applies the region's continuous player state (game-mode, walk/fly speed, flight) while inside,
-     * restoring each to the value the player had before entering once the override no longer applies.
+     * Applies region player state (game-mode, walk/fly speed, flight) while inside. Game mode changes
+     * only when the resolved flag changes, and restores only if the applied mode is still in place.
      *
      * <p>Every restore branch is gated on its map being non-empty. The read side already skips the
      * work via {@code worldUses}, but the restore side ran unconditionally — six map mutations against
@@ -948,18 +950,30 @@ public final class MovementListener implements Listener {
         final UUID uuid = player.getUniqueId();
         boolean owedChanged = false;
 
-        final GameMode mode = toSet.worldUses(Flags.GAME_MODE)
+        final GameMode mode = !Bypass.has(player) && toSet.worldUses(Flags.GAME_MODE)
             ? parseGameMode(toSet.queryValue(Flags.GAME_MODE)) : null;
         if (mode != null) {
-            if (player.getGameMode() != mode) {
-                owedChanged |= savedGameModes.putIfAbsent(uuid, player.getGameMode()) == null;
-                player.setGameMode(mode);
+            final GameMode previous = appliedGameModes.put(uuid, mode);
+
+            if (previous != mode) {
+                final GameMode current = player.getGameMode();
+
+                if (previous != null && current != previous && savedGameModes.remove(uuid) != null) {
+                    owedChanged = true;
+                }
+
+                if (current != mode) {
+                    owedChanged |= savedGameModes.putIfAbsent(uuid, current) == null;
+
+                    player.setGameMode(mode);
+                }
             }
-        } else if (!savedGameModes.isEmpty()) {
+        } else if (!appliedGameModes.isEmpty()) {
+            final GameMode applied = appliedGameModes.remove(uuid);
             final GameMode saved = savedGameModes.remove(uuid);
             if (saved != null) {
                 owedChanged = true;
-                if (player.getGameMode() != saved) {
+                if (!Bypass.has(player) && player.getGameMode() == applied) {
                     player.setGameMode(saved);
                 }
             }
@@ -1082,6 +1096,8 @@ public final class MovementListener implements Listener {
     public void onJoin(final PlayerJoinEvent event) {
         final Player joiner = event.getPlayer();
 
+        Bypass.join(joiner);
+
         if (taskMode) {
             startPoll(joiner);
         }
@@ -1143,7 +1159,7 @@ public final class MovementListener implements Listener {
      * join, or from the disable for the players the disabling region owns.
      */
     private static void apply(final Player player, final PendingRestores.State owed) {
-        if (owed.gameMode() != null) {
+        if (owed.gameMode() != null && !Bypass.has(player)) {
             player.setGameMode(owed.gameMode());
         }
         if (owed.walkSpeed() != null) {
@@ -1172,12 +1188,16 @@ public final class MovementListener implements Listener {
         chatTags.clear(uuid);
         hidden.remove(uuid);
         lastPosition.remove(uuid);
-        Bypass.clear(uuid);
 
+        final boolean bypass = Bypass.has(player);
+        final GameMode applied = appliedGameModes.remove(uuid);
         final GameMode mode = savedGameModes.remove(uuid);
-        if (mode != null) {
+        if (mode != null && !bypass && player.getGameMode() == applied) {
             player.setGameMode(mode);
         }
+
+        Bypass.clear(uuid);
+
         final Float walk = savedWalkSpeed.remove(uuid);
         if (walk != null) {
             player.setWalkSpeed(walk);
