@@ -12,6 +12,7 @@ import org.jspecify.annotations.Nullable;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 import java.util.logging.Level;
 
 /**
@@ -213,6 +214,83 @@ public final class RegionContainerImpl implements RegionContainer {
         });
     }
 
+    /** Replaces the cached regions of each loaded world with a fresh copy from storage. */
+    public void loadRegions(final Consumer<int[]> complete) {
+        final Map<UUID, Loaded> snapshot = Map.copyOf(loaded);
+
+        plugin.getServer().getAsyncScheduler().runNow(plugin, _ -> {
+            int count = 0;
+
+            for (final Map.Entry<UUID, Loaded> entry : snapshot.entrySet()) {
+                final UUID uid = entry.getKey();
+                final Loaded previous = entry.getValue();
+                final String name = previous.name();
+                final RegionManager manager = new RegionManager();
+
+                try {
+                    synchronized (storeLock(name)) {
+                        if (loaded.get(uid) != previous) {
+                            continue;
+                        }
+
+                        store.load(name, manager);
+
+                        if (manager.getRegion(GlobalProtectedRegion.ID) == null) {
+                            manager.addRegion(new GlobalProtectedRegion());
+                        }
+
+                        manager.clearDirty();
+                        loaded.put(uid, new Loaded(name, manager));
+
+                        republishManagers();
+
+                        failedLoads.remove(name);
+                    }
+
+                    FlagLifecycle.resolvePending(manager);
+
+                    warnAboutUnenforcedGroups(name, manager);
+
+                    count++;
+                } catch (final Exception e) {
+                    plugin.getLogger().log(Level.SEVERE, "Failed to reload regions for world " + name, e);
+                }
+            }
+
+            complete.accept(new int[] {count, snapshot.size()});
+        });
+    }
+
+    /** Forces every loaded world's current regions to storage, regardless of its dirty bit. */
+    public void saveRegions(final Consumer<int[]> complete) {
+        final Map<UUID, Loaded> snapshot = Map.copyOf(loaded);
+
+        plugin.getServer().getAsyncScheduler().runNow(plugin, _ -> {
+            int count = 0;
+
+            for (final Map.Entry<UUID, Loaded> entry : snapshot.entrySet()) {
+                final Loaded world = entry.getValue();
+                final String name = world.name();
+
+                try {
+                    synchronized (storeLock(name)) {
+                        if (loaded.get(entry.getKey()) != world || failedLoads.contains(name)) {
+                            continue;
+                        }
+
+                        store.save(name, world.manager());
+                    }
+
+                    count++;
+                } catch (final Exception e) {
+                    plugin.getLogger().log(Level.WARNING, "Failed to save regions for world " + name, e);
+                }
+            }
+
+            complete.accept(new int[] {count, snapshot.size()});
+        });
+    }
+
     /**
      * Persist every world synchronously — for plugin shutdown, where the async scheduler is stopping.
      */
@@ -248,6 +326,12 @@ public final class RegionContainerImpl implements RegionContainer {
         plugin.getServer().getAsyncScheduler().runNow(plugin, task -> {
             try {
                 synchronized (storeLock(name)) {
+                    if (loaded.values().stream().anyMatch(
+                        world -> world.name().equals(name) && world.manager() != manager
+                    )) {
+                        return;
+                    }
+
                     store.save(name, manager);
                 }
             } catch (final Exception e) {

@@ -88,7 +88,7 @@ public final class RegionCommands {
         new Section("flags", "Flags", "set flags, priority and inheritance"),
         new Section("people", "Owners & members", "decide who may build"),
         new Section("menus", "Menus", "click through it instead of typing"),
-        new Section("admin", "Administration", "reload, import, bypass, diagnostics"),
+        new Section("admin", "Administration", "reload, region storage, import, bypass, diagnostics"),
         new Section("other", "Other", "everything else"));
 
     /**
@@ -112,6 +112,8 @@ public final class RegionCommands {
         Map.entry("settings", "menus"),
         Map.entry("bypass", "admin"),
         Map.entry("reload", "admin"),
+        Map.entry("load-regions", "admin"),
+        Map.entry("save-regions", "admin"),
         Map.entry("migrate", "admin"),
         Map.entry("compat", "admin"));
 
@@ -1120,6 +1122,36 @@ public final class RegionCommands {
         plugin.reloadSettings();
         success(sender, "Reloaded messages, config, movement mode, and autosave interval. "
             + "<gray>(Storage backend and wand item still need a restart.)");
+    }
+
+    @Command("uworldguard|uwg|worldguard|wg|region|regions|rg load-regions")
+    @CommandDescription("Replace cached regions with those in storage for all loaded worlds")
+    @Permission("uworldguard.load-regions")
+    public void loadRegions(final Source sender) {
+        container.loadRegions(counts -> reportResult(sender, "Loaded", counts));
+    }
+
+    @Command("uworldguard|uwg|worldguard|wg|region|regions|rg save-regions")
+    @CommandDescription("Save cached regions to storage for all loaded worlds")
+    @Permission("uworldguard.save-regions")
+    public void saveRegions(final Source sender) {
+        container.saveRegions(counts -> reportResult(sender, "Saved", counts));
+    }
+
+    private void reportResult(final Source sender, final String action, final int[] counts) {
+        final Runnable reply = () -> sender.source().sendMessage(Messages.format(
+            (counts[0] == counts[1] ? "<green>" : "<red>")
+                + action + " regions for " + counts[0] + "/" + counts[1]
+                + " loaded worlds. Check the console for any failures."
+        ));
+
+        if (sender.source() instanceof final Player player) {
+            player.getScheduler().run(plugin, _ -> reply.run(), null);
+
+            return;
+        }
+
+        plugin.getServer().getGlobalRegionScheduler().execute(plugin, reply);
     }
 
     @Command("uworldguard|uwg|worldguard|wg|region|regions|rg menu <id>")
