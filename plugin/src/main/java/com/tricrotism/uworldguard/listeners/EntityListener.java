@@ -32,7 +32,7 @@ import java.util.List;
 
 /**
  * Enforces mob-spawning and deny-spawn, the explosion flags, mob grief (enderman, ravager, wither,
- * ender dragon), mob-damage, damage-animals, firework-damage, lightning, potion-splash,
+ * ender dragon), mob-damage, damage-animals, allow-entity-damage, firework-damage, lightning, potion-splash,
  * item-frame/painting/armor-stand destruction, and mob-drops / exp-drops. Also pvp for thrown and
  * lingering potions, and block-break for blocks a projectile shatters.
  */
@@ -274,6 +274,11 @@ public final class EntityListener implements Listener {
             && query.usesFlag(victim.getWorld(), Flags.FIREWORK_DAMAGE)
             && !query.testState(victim, Flags.FIREWORK_DAMAGE)) {
             event.setCancelled(true);
+            return;
+        }
+
+        if (query.usesFlag(victim.getWorld(), Flags.ALLOW_ENTITY_DAMAGE)
+            && query.getApplicableRegions(victim).flagSetContains(Flags.ALLOW_ENTITY_DAMAGE, victim.getType())) {
             return;
         }
 

@@ -127,6 +127,7 @@ public final class Flags {
     public static final StateFlag BREEZE_CHARGE_EXPLOSION = register(FlagCategory.MOBS, new StateFlag("breeze-charge-explosion", true));
     public static final StateFlag LIGHTNING = register(FlagCategory.MOBS, new StateFlag("lightning", true));
     public static final EntityTypeSetFlag DENY_SPAWN = register(FlagCategory.MOBS, new EntityTypeSetFlag("deny-spawn"));
+    public static final EntityTypeSetFlag ALLOW_ENTITY_DAMAGE = register(FlagCategory.MOBS, new EntityTypeSetFlag("allow-entity-damage"));
     public static final StateFlag RAID = register(FlagCategory.MOBS, new StateFlag("raid", true));
     public static final StateFlag ENTITY_TRANSFORM = register(FlagCategory.MOBS, new StateFlag("entity-transform", true));
     public static final StateFlag BREED = register(FlagCategory.MOBS, new StateFlag("breed", true));

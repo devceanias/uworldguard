@@ -244,9 +244,9 @@ have PAPI installed — useful for gating on a level from another plugin.
 </details>
 
 <details>
-<summary><b>Mobs &amp; explosions</b> (21 flags)</summary>
+<summary><b>Mobs &amp; explosions</b> (22 flags)</summary>
 
-`mob-spawning` · `deny-spawn` · `mob-damage` · `creeper-explosion` · `other-explosion` ·
+`mob-spawning` · `deny-spawn` · `allow-entity-damage` · `mob-damage` · `creeper-explosion` · `other-explosion` ·
 `enderman-grief` · `ghast-fireball` · `wither-damage` · `enderdragon-block-damage` ·
 `ravager-grief` · `snowman-trails` · `breeze-charge-explosion` · `lightning` · `mob-drops` ·
 `exp-drops` · `raid` · `entity-transform` · `breed` · `tame` · `door-break` · `copper-golem`
@@ -257,6 +257,9 @@ building one (26.x); player-built golems are outside `mob-spawning` by design.
 `mob-spawning` is a blanket toggle over *natural* spawns. `deny-spawn` is a list of entity types
 that may never appear, whatever put them there — spawn egg, spawner, or another plugin:
 `/wg flag spawn deny-spawn CREEPER,minecraft:phantom`.
+
+`allow-entity-damage` is a list of entity types anyone may hit, even where they can't build and
+`damage-animals` is denied: `/wg flag spawn allow-entity-damage BAT,COD`.
 </details>
 
 <details>
