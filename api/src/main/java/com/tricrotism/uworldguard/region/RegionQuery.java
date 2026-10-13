@@ -1,7 +1,9 @@
 package com.tricrotism.uworldguard.region;
 
 import com.tricrotism.uworldguard.flags.Flag;
+import com.tricrotism.uworldguard.flags.State;
 import com.tricrotism.uworldguard.flags.StateFlag;
+import com.tricrotism.uworldguard.util.BlockVector3;
 import org.bukkit.Location;
 import org.bukkit.World;
 import org.bukkit.block.Block;
@@ -10,6 +12,7 @@ import org.bukkit.entity.Player;
 import org.jspecify.annotations.NullMarked;
 import org.jspecify.annotations.Nullable;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -106,6 +109,86 @@ public final class RegionQuery {
      */
     public boolean testState(final Location location, final StateFlag flag, final @Nullable Player player) {
         return getApplicableRegions(location).testState(flag, player == null ? null : player.getUniqueId());
+    }
+
+    /**
+     * Drops every block where {@link #testState(Block, StateFlag)} is false. Cheapest answer first:
+     * a world where no region sets {@code flag} reads the flag's default everywhere; a storage
+     * backend that proves {@code flag} reads the same over the blocks' bounding box answers for all
+     * of them; otherwise, with a backend index, the regions touching the box are fetched once and
+     * each block is tested against that short list rather than looked up in the index again.
+     */
+    public void removeDenied(final World world, final List<Block> blocks, final StateFlag flag) {
+        if (blocks.isEmpty()) {
+            return;
+        }
+        final RegionManager manager = container.get(world);
+        if (manager != null && !manager.anyRegionUses(flag)) {
+            if (flag.getDefault() != State.ALLOW) {
+                blocks.clear();
+            }
+            return;
+        }
+        if (manager != null && manager.resolvesBoxes()) {
+            int minX = Integer.MAX_VALUE, minY = Integer.MAX_VALUE, minZ = Integer.MAX_VALUE;
+            int maxX = Integer.MIN_VALUE, maxY = Integer.MIN_VALUE, maxZ = Integer.MIN_VALUE;
+            for (int i = 0, n = blocks.size(); i < n; i++) {
+                final Block b = blocks.get(i);
+                minX = Math.min(minX, b.getX());
+                minY = Math.min(minY, b.getY());
+                minZ = Math.min(minZ, b.getZ());
+                maxX = Math.max(maxX, b.getX());
+                maxY = Math.max(maxY, b.getY());
+                maxZ = Math.max(maxZ, b.getZ());
+            }
+            final State across = manager.stateAcross(minX, minY, minZ, maxX, maxY, maxZ, flag);
+            if (across == State.ALLOW) {
+                return;
+            }
+            if (across == State.DENY) {
+                blocks.clear();
+                return;
+            }
+            removeDeniedAmong(manager, blocks, flag, manager.getRegionsIntersecting(
+                BlockVector3.at(minX, minY, minZ), BlockVector3.at(maxX, maxY, maxZ)));
+            return;
+        }
+        blocks.removeIf(block -> !testState(block, flag));
+    }
+
+    /**
+     * The per-block test against {@code candidates}, every region whose bounding box touches the
+     * blocks, sorted by priority. Resolution is the engine's own, the same answer a point lookup gives.
+     *
+     * <p>One scratch list serves every block. The set built over it takes it without copying and is
+     * dropped before the next block refills it, and the filtered list keeps the candidates' order, so
+     * the set's sort finds it already sorted.
+     */
+    private static void removeDeniedAmong(
+        final RegionManager manager, final List<Block> blocks, final StateFlag flag,
+        final List<ProtectedRegion> candidates
+    ) {
+        final ProtectedRegion global = manager.getRegion(GlobalProtectedRegion.ID);
+        if (candidates.isEmpty()) {
+            if (!new ApplicableRegionSet(List.of(), global, manager, null).testState(flag)) {
+                blocks.clear();
+            }
+            return;
+        }
+        final List<ProtectedRegion> here = new ArrayList<>(candidates.size());
+        blocks.removeIf(block -> {
+            final int x = block.getX();
+            final int y = block.getY();
+            final int z = block.getZ();
+            here.clear();
+            for (int i = 0, n = candidates.size(); i < n; i++) {
+                final ProtectedRegion region = candidates.get(i);
+                if (region.contains(x, y, z)) {
+                    here.add(region);
+                }
+            }
+            return !new ApplicableRegionSet(here, global, manager, null).testState(flag);
+        });
     }
 
     public <T> @Nullable T queryValue(final Location location, final Flag<T> flag) {

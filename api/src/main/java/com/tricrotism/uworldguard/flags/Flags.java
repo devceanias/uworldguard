@@ -59,6 +59,12 @@ public final class Flags {
     public static final StateFlag BUILD = register(FlagCategory.PROTECTION, new StateFlag("build", true));
     public static final StateFlag BLOCK_BREAK = register(FlagCategory.PROTECTION, new StateFlag("block-break", true));
     public static final StateFlag BLOCK_PLACE = register(FlagCategory.PROTECTION, new StateFlag("block-place", true));
+    /**
+     * When {@code allow}, players may only break blocks that a player placed in the region, so an
+     * arena's map survives while everything built during a match can be broken. Off by default.
+     * {@code allow-block-break} still exempts the materials it lists.
+     */
+    public static final StateFlag BREAK_PLACED_ONLY = register(FlagCategory.PROTECTION, new StateFlag("break-placed-only", false));
     public static final StateFlag INTERACT = register(FlagCategory.PROTECTION, new StateFlag("interact", true));
     public static final StateFlag USE = register(FlagCategory.PROTECTION, new StateFlag("use", true));
     public static final StateFlag CHEST_ACCESS = register(FlagCategory.PROTECTION, new StateFlag("chest-access", true));
@@ -121,6 +127,7 @@ public final class Flags {
     public static final StateFlag BREEZE_CHARGE_EXPLOSION = register(FlagCategory.MOBS, new StateFlag("breeze-charge-explosion", true));
     public static final StateFlag LIGHTNING = register(FlagCategory.MOBS, new StateFlag("lightning", true));
     public static final EntityTypeSetFlag DENY_SPAWN = register(FlagCategory.MOBS, new EntityTypeSetFlag("deny-spawn"));
+    public static final EntityTypeSetFlag ALLOW_ENTITY_DAMAGE = register(FlagCategory.MOBS, new EntityTypeSetFlag("allow-entity-damage"));
     public static final StateFlag RAID = register(FlagCategory.MOBS, new StateFlag("raid", true));
     public static final StateFlag ENTITY_TRANSFORM = register(FlagCategory.MOBS, new StateFlag("entity-transform", true));
     public static final StateFlag BREED = register(FlagCategory.MOBS, new StateFlag("breed", true));

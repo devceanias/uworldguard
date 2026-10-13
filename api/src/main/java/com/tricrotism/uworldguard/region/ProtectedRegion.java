@@ -141,6 +141,7 @@ public abstract class ProtectedRegion {
 
     public final void setPriority(final int priority) {
         this.priority = priority;
+        edited(false);
     }
 
     public final @Nullable ProtectedRegion getParent() {
@@ -160,11 +161,21 @@ public abstract class ProtectedRegion {
     private static final Object PARENT_LOCK = new Object();
 
     /**
+     * How many regions name this one as their parent. Written under {@link #PARENT_LOCK}.
+     */
+    private volatile int children;
+
+    /**
      * Set the parent for flag inheritance.
      *
      * @throws IllegalArgumentException if it would create a circular relationship
      */
     public final void setParent(final @Nullable ProtectedRegion parent) {
+        assignParent(parent);
+        edited(false);
+    }
+
+    private void assignParent(final @Nullable ProtectedRegion parent) {
         synchronized (PARENT_LOCK) {
             if (parent != null) {
                 for (@Nullable ProtectedRegion p = parent; p != null; p = p.parent) {
@@ -173,8 +184,23 @@ public abstract class ProtectedRegion {
                     }
                 }
             }
+            final ProtectedRegion previous = this.parent;
+            if (previous != null) {
+                previous.children--;
+            }
+            if (parent != null) {
+                parent.children++;
+            }
             this.parent = parent;
         }
+    }
+
+    /**
+     * Internal: whether any region names this one as its parent. Lets a removal skip the walk over
+     * every region in the world that unparents children, which for a childless region finds nothing.
+     */
+    public final boolean uwgHasChildren() {
+        return children > 0;
     }
 
     public final DefaultDomain getOwners() {
@@ -276,7 +302,7 @@ public abstract class ProtectedRegion {
         } else {
             flags.put(flag, value);
         }
-        edited();
+        edited(true);
     }
 
     /**
@@ -287,13 +313,22 @@ public abstract class ProtectedRegion {
     }
 
     /**
-     * Tells the owning world its flag index and stored document are both out of date. A region not
-     * yet added to a manager has nobody to tell, and needs nobody: adding it retires the index.
+     * Internal: the manager currently holding this region, or {@code null} once it has been removed
+     * or replaced, or before it is added. Plugins should not call this.
      */
-    private void edited() {
+    public final @Nullable RegionManager uwgOwner() {
+        return owner;
+    }
+
+    /**
+     * Tells the owning world its stored document is out of date, and its flag index too when
+     * {@code flagsChanged}. A region not yet added to a manager has nobody to tell, and needs nobody:
+     * adding it retires the index.
+     */
+    private void edited(final boolean flagsChanged) {
         final RegionManager manager = owner;
         if (manager != null) {
-            manager.markDirty();
+            manager.regionEdited(this, flagsChanged);
         }
     }
 
@@ -333,7 +368,7 @@ public abstract class ProtectedRegion {
         } else {
             flagGroups.put(flag, group);
         }
-        edited();
+        edited(true);
     }
 
     /**
@@ -400,7 +435,9 @@ public abstract class ProtectedRegion {
         copyDomain(other.owners, owners);
         copyDomain(other.members, members);
         priority = other.priority;
-        setParent(other.parent);
+        // Quiet on purpose: this runs inside the manager's compute, and notifying an index from there
+        // could re-enter the same map entry. The manager tells the index once the swap is done.
+        assignParent(other.parent);
     }
 
     private static void copyDomain(final DefaultDomain from, final DefaultDomain to) {
