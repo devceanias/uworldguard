@@ -120,17 +120,25 @@ public class RegionQuery {
     }
 
     public ApplicableRegionSet getApplicableRegions(final Location location) {
+        return uwgApplicableRegions(worldOf(location), location.getBlockX(), location.getBlockY(),
+            location.getBlockZ());
+    }
+
+    /**
+     * Internal: the applicable regions at a block of a Bukkit world, for callers that already hold
+     * one and would otherwise build a WorldEdit location only to have it unwrapped again.
+     */
+    public static ApplicableRegionSet uwgApplicableRegions(
+        final org.bukkit.World world, final int x, final int y, final int z
+    ) {
         com.tricrotism.uworldguard.wgcompat.CompatDiagnostics.QUERIES.increment();
-        final org.bukkit.World world = worldOf(location);
         final com.tricrotism.uworldguard.region.RegionManager manager =
             world == null || !com.tricrotism.uworldguard.wgcompat.WgCompatBridge.active() ? null
                 : com.tricrotism.uworldguard.wgcompat.WgCompatBridge.container().get(world);
         if (manager == null) {
             return com.sk89q.worldguard.protection.RegionResultSet.fromSortedList(List.of(), null);
         }
-        return new com.tricrotism.uworldguard.wgcompat.WrappedRegionSet(
-            manager.getApplicableRegions(location.getBlockX(), location.getBlockY(), location.getBlockZ()),
-            manager);
+        return com.tricrotism.uworldguard.wgcompat.WrappedRegionSet.of(manager.getApplicableRegions(x, y, z), manager);
     }
 
     public StateFlag.State queryState(
@@ -148,7 +156,7 @@ public class RegionQuery {
     public boolean testBuild(
         final Location location, final RegionAssociable associable, final StateFlag... flag
     ) {
-        return testBuild(getApplicableRegions(location), associable, flag);
+        return uwgTestBuild(getApplicableRegions(location), associable, flag);
     }
 
     public <K> boolean testBuild(
@@ -161,7 +169,7 @@ public class RegionQuery {
         if (mapped != null) {
             return mapped == StateFlag.State.ALLOW;
         }
-        return testBuild(set, associable, flag);
+        return uwgTestBuild(set, associable, flag);
     }
 
     public <V> V queryValue(final Location location, final RegionAssociable associable, final Flag<V> flag) {
@@ -211,12 +219,14 @@ public class RegionQuery {
     }
 
     /**
-     * WorldGuard combines the build result with the queried flags after converting its {@code DENY}
+     * Internal: the build test on a set the caller already resolved.
+     *
+     * <p>WorldGuard combines the build result with the queried flags after converting its {@code DENY}
      * to nothing, so an explicit {@code allow} on one of the flags opens the region to non-members
      * while an explicit {@code deny} still refuses members. Testing membership first instead would
      * make that {@code allow} inert, which is not what a plugin querying this API expects.
      */
-    private static boolean testBuild(
+    public static boolean uwgTestBuild(
         final ApplicableRegionSet set, final RegionAssociable associable, final StateFlag... flag
     ) {
         if (flag.length == 0) {

@@ -2,7 +2,6 @@ package com.tricrotism.uworldguard.listeners;
 
 import com.destroystokyo.paper.event.entity.EntityZapEvent;
 import com.sk89q.worldguard.bukkit.protection.events.DisallowedPVPEvent;
-import com.sk89q.worldguard.bukkit.util.Events;
 import com.tricrotism.uworldguard.config.Bypass;
 import com.tricrotism.uworldguard.config.EventGate;
 import com.tricrotism.uworldguard.flags.Flags;
@@ -10,6 +9,8 @@ import com.tricrotism.uworldguard.flags.StateFlag;
 import com.tricrotism.uworldguard.region.ApplicableRegionSet;
 import com.tricrotism.uworldguard.region.RegionContainerImpl;
 import com.tricrotism.uworldguard.region.RegionQuery;
+import com.tricrotism.uworldguard.text.DenyDebug;
+import io.papermc.paper.event.entity.EntityPushedByEntityAttackEvent;
 import org.bukkit.World;
 import org.bukkit.block.Block;
 import org.bukkit.entity.*;
@@ -19,6 +20,8 @@ import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.*;
 import org.bukkit.event.hanging.HangingBreakByEntityEvent;
+import org.bukkit.event.hanging.HangingBreakEvent;
+import org.bukkit.event.player.PlayerFishEvent;
 import org.bukkit.event.raid.RaidTriggerEvent;
 import org.bukkit.event.weather.LightningStrikeEvent;
 import org.bukkit.potion.PotionEffect;
@@ -28,7 +31,6 @@ import org.jspecify.annotations.NullMarked;
 import org.jspecify.annotations.Nullable;
 
 import java.util.Collection;
-import java.util.List;
 
 /**
  * Enforces mob-spawning and deny-spawn, the explosion flags, mob grief (enderman, ravager, wither,
@@ -82,6 +84,11 @@ public final class EntityListener implements Listener {
         }
     }
 
+    /**
+     * Blocks a blast may break: its explosion flag, then build rights as in WorldGuard. Whoever lit
+     * the TNT breaks only where they could build. A blast nobody is behind breaks only in the claim it
+     * started in, so a creeper or a cannon outside a claim cannot dig into it.
+     */
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     public void onExplode(final EntityExplodeEvent event) {
         if (EventGate.disabled(event)) {
@@ -90,12 +97,17 @@ public final class EntityListener implements Listener {
         if (event.blockList().isEmpty()) {
             return;
         }
-        final StateFlag flag = explosionFlag(event.getEntity());
-        if (!query.usesFlag(event.getEntity().getWorld(), flag)) {
+        final Entity entity = event.getEntity();
+        final StateFlag flag = explosionFlag(entity);
+        final Player breaker = Attackers.of(entity);
+        if (breaker != null && Bypass.has(breaker)) {
+            if (query.usesFlag(entity.getWorld(), flag)) {
+                query.removeDenied(entity.getWorld(), event.blockList(), flag);
+            }
             return;
         }
-
-        query.removeDenied(event.getEntity().getWorld(), event.blockList(), flag);
+        query.removeUnbreakable(entity.getWorld(), event.blockList(), flag, flag == Flags.TNT,
+            breaker == null ? null : breaker.getUniqueId(), breaker == null ? Attackers.sourceRegions(query, entity) : null);
     }
 
     /**
@@ -158,16 +170,16 @@ public final class EntityListener implements Listener {
 
     /**
      * Splash and lingering potions. Cancelling outright would also destroy a beneficial potion thrown
-     * by its owner, so instead every affected entity has its intensity zeroed — the bottle still
+     * by its owner, so instead every affected entity has its intensity zeroed. The bottle still
      * breaks and the particles still show, but nothing inside the region is affected.
      *
-     * <p>The affected entities are copied because {@code setIntensity} writes back into the live
-     * collection being walked, so the registry check comes first: with the flag unused nowhere on the
-     * server, the handler costs a bitset test per world and copies nothing.
+     * <p>{@code getAffectedEntities} already returns a fresh copy, so {@code setIntensity} can change
+     * the event while the loop walks it. The registry checks come first: with the flags unused on the
+     * server, the handler costs a bitset test per world and builds no copy.
      *
      * <p>A harmful potion thrown by a player is also {@code pvp}: poison or slowness reaching another
      * player where pvp is denied to the thrower has its intensity zeroed for that player. Beneficial
-     * potions still reach allies.
+     * potions still reach allies. A witch's potion is {@code mob-damage} for every player it reaches.
      */
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     public void onPotionSplash(final PotionSplashEvent event) {
@@ -178,15 +190,20 @@ public final class EntityListener implements Listener {
         final ThrownPotion potion = event.getPotion();
         final Player thrower = container.anyRegionUses(Flags.PVP)
             && potion.getShooter() instanceof Player player && harmful(potion.getEffects()) ? player : null;
-        if (!splashFlag && thrower == null) {
+        final boolean mobThrown = container.anyRegionUses(Flags.MOB_DAMAGE)
+            && potion.getShooter() instanceof LivingEntity shooter && !(shooter instanceof Player);
+        if (!splashFlag && thrower == null && !mobThrown) {
             return;
         }
 
-        for (final LivingEntity affected : List.copyOf(event.getAffectedEntities())) {
+        for (final LivingEntity affected : event.getAffectedEntities()) {
             if (splashFlag && !query.testState(affected, Flags.POTION_SPLASH)) {
                 event.setIntensity(affected, 0.0);
             } else if (thrower != null && affected instanceof Player defender
                 && pvpDenied(thrower, defender, event)) {
+                event.setIntensity(affected, 0.0);
+            } else if (mobThrown && affected instanceof Player
+                && !query.testState(affected, Flags.MOB_DAMAGE)) {
                 event.setIntensity(affected, 0.0);
             }
         }
@@ -211,13 +228,27 @@ public final class EntityListener implements Listener {
     }
 
     /**
-     * The {@code pvp} test shared by every indirect attack. Hitting yourself is never pvp.
+     * The {@code pvp} test shared by every indirect attack. Hitting yourself is never pvp. Either
+     * side's region can deny, as for a direct hit.
      */
     private boolean pvpDenied(final Player attacker, final Player defender, final Event cause) {
-        return !attacker.equals(defender)
-            && !query.getApplicableRegions(defender).testState(Flags.PVP, attacker.getUniqueId())
+        final boolean denied = !attacker.equals(defender)
+            && (!query.getApplicableRegions(defender).testState(Flags.PVP, attacker.getUniqueId())
+            || !query.getApplicableRegions(attacker).testState(Flags.PVP, attacker.getUniqueId()))
             && !Bypass.has(attacker)
-            && !Events.fireAndTestCancel(new DisallowedPVPEvent(attacker, defender, cause));
+            && !Attackers.pvpRefusalOverridden(attacker, defender, cause);
+        if (denied && DenyDebug.watching(attacker)) {
+            final ApplicableRegionSet at = query.getApplicableRegions(defender);
+            DenyDebug.explain(attacker, Flags.PVP, at.testState(Flags.PVP, attacker.getUniqueId())
+                ? query.getApplicableRegions(attacker) : at);
+        }
+        return denied;
+    }
+
+    private void explainProtected(final Entity victim, final StateFlag flag) {
+        if (victim instanceof Player player && DenyDebug.watching(player)) {
+            DenyDebug.explainProtected(player, flag, query.getApplicableRegions(victim));
+        }
     }
 
     private static boolean harmful(final AreaEffectCloud cloud) {
@@ -263,58 +294,132 @@ public final class EntityListener implements Listener {
             return;
         }
 
-        if (victim instanceof Player && damager instanceof Mob
-            && query.usesFlag(victim.getWorld(), Flags.MOB_DAMAGE)
-            && !query.testState(victim, Flags.MOB_DAMAGE)) {
+        final StateFlag blast = switch (damager) {
+            case EnderCrystal _ -> Flags.OTHER_EXPLOSION;
+            case Creeper _ -> Flags.CREEPER_EXPLOSION;
+            case LightningStrike _ -> Flags.LIGHTNING;
+            default -> null;
+        };
+        ApplicableRegionSet at = null;
+        if (blast != null && query.usesFlag(victim.getWorld(), blast)) {
+            at = query.getApplicableRegions(victim);
+            if (!at.testState(blast)) {
+                event.setCancelled(true);
+                explainProtected(victim, blast);
+                return;
+            }
+        }
+
+        if (victim instanceof Player player) {
+            final boolean shotByMob = damager instanceof Projectile projectile
+                && projectile.getShooter() instanceof LivingEntity shooter && !(shooter instanceof Player);
+            final boolean mob = shotByMob
+                || damager instanceof Mob && !(damager instanceof Tameable pet && pet.isTamed());
+            if (mob && query.usesFlag(victim.getWorld(), Flags.MOB_DAMAGE)) {
+                if (at == null) {
+                    at = query.getApplicableRegions(victim);
+                }
+                if (!at.testState(Flags.MOB_DAMAGE, player.getUniqueId())) {
+                    event.setCancelled(true);
+                    explainProtected(victim, Flags.MOB_DAMAGE);
+                    return;
+                }
+            }
+            if (shotByMob && damager instanceof Fireball) {
+                final StateFlag flag = explosionFlag(damager);
+                if (query.usesFlag(victim.getWorld(), flag)) {
+                    if (at == null) {
+                        at = query.getApplicableRegions(victim);
+                    }
+                    if (!at.testState(flag)) {
+                        event.setCancelled(true);
+                        explainProtected(victim, flag);
+                        return;
+                    }
+                }
+            }
+        }
+
+        if (damager instanceof Firework && query.usesFlag(victim.getWorld(), Flags.FIREWORK_DAMAGE)) {
+            if (at == null) {
+                at = query.getApplicableRegions(victim);
+            }
+            if (!at.testState(Flags.FIREWORK_DAMAGE, victim instanceof Player player ? player.getUniqueId() : null)) {
+                event.setCancelled(true);
+                return;
+            }
+        }
+
+        final StateFlag flag = harmFlag(victim);
+        if (flag == null) {
+            return;
+        }
+        if (at == null) {
+            at = query.getApplicableRegions(victim);
+        }
+        if (!at.flagSetContains(Flags.ALLOW_ENTITY_DAMAGE, victim.getType()) && !mayHarm(damager, at, flag)) {
             event.setCancelled(true);
+        }
+    }
+
+    /**
+     * The flag that guards {@code victim} against harm from someone else, or {@code null} for a
+     * player (pvp decides) or a hostile mob (anyone may fight it). {@link Flags#BUILD} stands for
+     * build rights alone, for villagers, golems and the like.
+     */
+    private static @Nullable StateFlag harmFlag(final Entity victim) {
+        return switch (victim) {
+            case Animals _ -> Flags.DAMAGE_ANIMALS;
+            case ItemFrame _ -> Flags.ENTITY_ITEM_FRAME_DESTROY;
+            case ArmorStand _ -> Flags.ENTITY_ARMOR_STAND_DESTROY;
+            case Vehicle _ -> Flags.VEHICLE_DESTROY;
+            case Player _, Enemy _ -> null;
+            case LivingEntity _ -> Flags.BUILD;
+            default -> null;
+        };
+    }
+
+    /**
+     * Whatever {@code damager} traces back to may harm something guarded by {@code flag}: a player by
+     * their build rights or bypass, anything else by where it came from.
+     */
+    private boolean mayHarm(final @Nullable Entity damager, final ApplicableRegionSet at, final StateFlag flag) {
+        final Player attacker = Attackers.of(damager);
+        if (attacker == null) {
+            return Attackers.sourceMayBuild(query, damager, at, flag);
+        }
+        final boolean allowed = flag == Flags.BUILD
+            ? at.canBuild(attacker.getUniqueId())
+            : at.testBuild(attacker.getUniqueId(), flag);
+        return allowed || Bypass.has(attacker);
+    }
+
+    /**
+     * Damage with no entity behind it: a bed or respawn anchor detonating in the wrong dimension, or
+     * a plugin explosion with no source, judged by {@code other-explosion} where the victim stands.
+     * Wither ticks keep landing after the player walks away from the skull or rose that caused them,
+     * so they are {@code mob-damage} there too.
+     */
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    public void onSourcelessDamage(final EntityDamageEvent event) {
+        final EntityDamageEvent.DamageCause cause = event.getCause();
+        final StateFlag flag = cause == EntityDamageEvent.DamageCause.BLOCK_EXPLOSION
+            ? Flags.OTHER_EXPLOSION
+            : cause == EntityDamageEvent.DamageCause.WITHER && event.getEntity() instanceof Player
+            ? Flags.MOB_DAMAGE : null;
+        if (flag == null || event instanceof EntityDamageByEntityEvent || EventGate.disabled(event)) {
             return;
         }
-
-        if (damager instanceof Firework
-            && query.usesFlag(victim.getWorld(), Flags.FIREWORK_DAMAGE)
-            && !query.testState(victim, Flags.FIREWORK_DAMAGE)) {
+        final Entity victim = event.getEntity();
+        if (!query.usesFlag(victim.getWorld(), flag)) {
+            return;
+        }
+        final boolean allowed = flag == Flags.MOB_DAMAGE
+            ? query.testState(victim, flag)
+            : query.getApplicableRegions(victim).testState(flag);
+        if (!allowed) {
             event.setCancelled(true);
-            return;
-        }
-
-        if (query.usesFlag(victim.getWorld(), Flags.ALLOW_ENTITY_DAMAGE)
-            && query.getApplicableRegions(victim).flagSetContains(Flags.ALLOW_ENTITY_DAMAGE, victim.getType())) {
-            return;
-        }
-
-        if (victim instanceof Animals) {
-            final Player attacker = resolveAttacker(damager);
-            if (attacker != null
-                && !query.getApplicableRegions(victim)
-                .testBuild(attacker.getUniqueId(), Flags.DAMAGE_ANIMALS)
-                && !Bypass.has(attacker)) {
-                event.setCancelled(true);
-            }
-            return;
-        }
-
-        final StateFlag flag = victim instanceof ItemFrame
-            ? Flags.ENTITY_ITEM_FRAME_DESTROY
-            : victim instanceof ArmorStand ? Flags.ENTITY_ARMOR_STAND_DESTROY : null;
-        if (flag != null) {
-            final Player attacker = resolveAttacker(damager);
-            final ApplicableRegionSet at = query.getApplicableRegions(victim);
-            final boolean allowed = attacker != null
-                ? at.testBuild(attacker.getUniqueId(), flag)
-                : at.testState(flag, null);
-            if (!allowed && (attacker == null || !Bypass.has(attacker))) {
-                event.setCancelled(true);
-            }
-            return;
-        }
-
-        if (victim instanceof LivingEntity && !(victim instanceof Enemy) && !(victim instanceof Player)) {
-            final Player attacker = resolveAttacker(damager);
-            if (attacker != null
-                && !query.getApplicableRegions(victim).canBuild(attacker.getUniqueId())
-                && !Bypass.has(attacker)) {
-                event.setCancelled(true);
-            }
+            explainProtected(victim, flag);
         }
     }
 
@@ -346,8 +451,16 @@ public final class EntityListener implements Listener {
             return;
         }
         final Entity entity = event.getEntity();
-        if (query.usesFlag(entity.getWorld(), Flags.ENTITY_TRANSFORM)
-            && !query.testState(entity, Flags.ENTITY_TRANSFORM)) {
+        ApplicableRegionSet at = null;
+        if (query.usesFlag(entity.getWorld(), Flags.ENTITY_TRANSFORM)) {
+            at = query.getApplicableRegions(entity);
+            if (!at.testState(Flags.ENTITY_TRANSFORM, entity instanceof Player player ? player.getUniqueId() : null)) {
+                event.setCancelled(true);
+                return;
+            }
+        }
+        final StateFlag flag = harmFlag(entity);
+        if (flag != null && !mayHarm(event.getBolt(), at != null ? at : query.getApplicableRegions(entity), flag)) {
             event.setCancelled(true);
         }
     }
@@ -432,6 +545,10 @@ public final class EntityListener implements Listener {
         final Entity victim = event.getEntity();
         final Entity source = event.getCombuster();
         if (!(victim instanceof Player defender)) {
+            final StateFlag flag = harmFlag(victim);
+            if (flag != null && !mayHarm(source, query.getApplicableRegions(victim), flag)) {
+                event.setCancelled(true);
+            }
             return;
         }
         if (source instanceof Mob) {
@@ -440,25 +557,52 @@ public final class EntityListener implements Listener {
             }
             return;
         }
-        final Player attacker = resolveAttacker(source);
+        final Player attacker = Attackers.of(source);
         if (attacker == null || attacker.equals(victim)) {
             return;
         }
-        if (!query.getApplicableRegions(victim).testState(Flags.PVP, attacker.getUniqueId())
-            && !Bypass.has(attacker)
-            && !Events.fireAndTestCancel(new DisallowedPVPEvent(attacker, defender, event))) {
+        if (pvpDenied(attacker, defender, event)) {
             event.setCancelled(true);
         }
     }
 
-    private static @Nullable Player resolveAttacker(final Entity source) {
-        if (source instanceof Player player) {
-            return player;
+    /**
+     * Knockback that lands without a hit, mostly a wind charge burst. Paper names the thrower as the
+     * pusher, so a charge fired from outside cannot launch a player standing in a {@code pvp} deny region.
+     */
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    public void onPvpKnockback(final EntityPushedByEntityAttackEvent event) {
+        if (!(event.getEntity() instanceof Player defender) || !container.anyRegionUses(Flags.PVP)
+            || EventGate.disabled(event)) {
+            return;
         }
-        if (source instanceof Projectile projectile && projectile.getShooter() instanceof Player player) {
-            return player;
+        final Player attacker = Attackers.of(event.getPushedBy());
+        if (attacker != null && pvpDenied(attacker, defender, event)) {
+            event.setCancelled(true);
         }
-        return null;
+    }
+
+    /**
+     * Reeling in a hooked entity drags it, so a rod cast from outside could pull a player out of a
+     * {@code pvp} deny region, or an animal, stand or cart out of a claim.
+     */
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    public void onFishPlayer(final PlayerFishEvent event) {
+        if (event.getState() != PlayerFishEvent.State.CAUGHT_ENTITY || EventGate.disabled(event)) {
+            return;
+        }
+        final Player player = event.getPlayer();
+        final Entity caught = event.getCaught();
+        if (caught instanceof Player defender) {
+            if (container.anyRegionUses(Flags.PVP) && pvpDenied(player, defender, event)) {
+                event.setCancelled(true);
+            }
+            return;
+        }
+        final StateFlag flag = caught == null ? null : harmFlag(caught);
+        if (flag != null && !mayHarm(player, query.getApplicableRegions(caught), flag)) {
+            event.setCancelled(true);
+        }
     }
 
     /**
@@ -478,17 +622,32 @@ public final class EntityListener implements Listener {
         if (flag == null) {
             return;
         }
-        final Player remover = resolveAttacker(event.getRemover());
+        if (!mayHarm(event.getRemover(), query.getApplicableRegions(hanging), flag)) {
+            event.setCancelled(true);
+        }
+    }
+
+    /**
+     * A frame or painting knocked down by an explosion with no entity behind it, mostly a bed or
+     * respawn anchor. Paper fires the plain event for that, which {@link #onHangingBreak} never
+     * sees. Nobody is behind the blast, so it is a non-member everywhere, as in WorldGuard.
+     */
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    public void onHangingExplode(final HangingBreakEvent event) {
+        if (event.getCause() != HangingBreakEvent.RemoveCause.EXPLOSION
+            || event instanceof HangingBreakByEntityEvent || EventGate.disabled(event)) {
+            return;
+        }
+        final Hanging hanging = event.getEntity();
         final ApplicableRegionSet at = query.getApplicableRegions(hanging);
-        if (remover != null
-            ? at.testBuild(remover.getUniqueId(), flag)
-            : at.testState(flag, null)) {
-            return;
+        final boolean allowed = switch (hanging) {
+            case ItemFrame _ -> at.testBuild(null, Flags.OTHER_EXPLOSION, Flags.ENTITY_ITEM_FRAME_DESTROY);
+            case Painting _ -> at.testBuild(null, Flags.OTHER_EXPLOSION, Flags.ENTITY_PAINTING_DESTROY);
+            default -> at.testBuild(null, Flags.OTHER_EXPLOSION);
+        };
+        if (!allowed) {
+            event.setCancelled(true);
         }
-        if (remover != null && Bypass.has(remover)) {
-            return;
-        }
-        event.setCancelled(true);
     }
 
     /**

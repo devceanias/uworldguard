@@ -1,6 +1,10 @@
 package com.tricrotism.uworldguard.text;
 
 import com.tricrotism.uworldguard.flags.Flags;
+import com.tricrotism.uworldguard.region.ApplicableRegionSet;
+import com.tricrotism.uworldguard.region.ProtectedCuboidRegion;
+import com.tricrotism.uworldguard.region.ProtectedRegion;
+import com.tricrotism.uworldguard.util.BlockVector3;
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -14,6 +18,7 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -69,6 +74,24 @@ class DenyMessageTest {
         messages("  no-permission: \"No.\"\n  no-permission-block-break: false\n")
             .sendDeny(player, Flags.BLOCK_BREAK, "Keep out");
 
+        assertNull(player.nextComponentMessage());
+    }
+
+    @Test
+    void regionDenyReadsTheSetOncePerCooldown() throws IOException {
+        final MessageService messages = messages("  no-permission: \"No.\"\n");
+        messages.setCooldownSeconds(60);
+        final ProtectedRegion region = new ProtectedCuboidRegion("claim", BlockVector3.at(0, 0, 0),
+            BlockVector3.at(15, 255, 15));
+        region.setFlag(Flags.DENY_MESSAGE, "Keep out");
+        final ApplicableRegionSet set = new ApplicableRegionSet(List.of(region), null);
+
+        messages.sendRegionDeny(player, Flags.BLOCK_PLACE, set);
+        messages.sendRegionDeny(player, Flags.BLOCK_PLACE, set);
+        messages.sendRegionDeny(player, Flags.BLOCK_BREAK, set);
+
+        assertEquals("Keep out", next());
+        assertEquals("Keep out", next());
         assertNull(player.nextComponentMessage());
     }
 }

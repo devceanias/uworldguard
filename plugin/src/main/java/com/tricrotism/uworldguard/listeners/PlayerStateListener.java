@@ -3,6 +3,7 @@ package com.tricrotism.uworldguard.listeners;
 import com.tricrotism.uworldguard.config.Bypass;
 import com.tricrotism.uworldguard.config.EventGate;
 import com.tricrotism.uworldguard.flags.Flags;
+import com.tricrotism.uworldguard.flags.StateFlag;
 import com.tricrotism.uworldguard.region.ApplicableRegionSet;
 import com.tricrotism.uworldguard.region.ProtectedRegion;
 import com.tricrotism.uworldguard.region.RegionQuery;
@@ -91,13 +92,13 @@ public final class PlayerStateListener implements Listener {
         if (event.getTo() == null) {
             return;
         }
+        // Note: since 1.21.4 chorus fruit teleports as a consume effect, and CHORUS_FRUIT is never sent
         final var flag = switch (event.getCause().name()) {
             case "ENDER_PEARL" -> Flags.ENDERPEARL;
-            case "CHORUS_FRUIT" -> Flags.CHORUS_TELEPORT;
+            case "CHORUS_FRUIT", "CONSUMABLE_EFFECT" -> Flags.CHORUS_TELEPORT;
             default -> null;
         };
-        if (flag != null && !query.testState(event.getTo(), flag)
-            && !Bypass.has(event.getPlayer())) {
+        if (flag != null && teleportRefused(event, flag)) {
             event.setCancelled(true);
             return;
         }
@@ -107,6 +108,27 @@ public final class PlayerStateListener implements Listener {
             return;
         }
         checkExitViaTeleport(event);
+    }
+
+    /**
+     * As in WorldGuard, the flag is tested for the player both where the pearl or fruit was used and
+     * where it lands. So a deny also stops someone throwing their way out, and a {@code -g} group applies.
+     */
+    private boolean teleportRefused(final PlayerTeleportEvent event, final StateFlag flag) {
+        final Player player = event.getPlayer();
+        final UUID id = player.getUniqueId();
+        ApplicableRegionSet set = query.getApplicableRegions(event.getFrom());
+        if (set.testState(flag, id)) {
+            set = query.getApplicableRegions(event.getTo());
+            if (set.testState(flag, id)) {
+                return false;
+            }
+        }
+        if (Bypass.has(player)) {
+            return false;
+        }
+        messages.sendRegionDeny(player, flag, set);
+        return true;
     }
 
     /**
@@ -132,6 +154,9 @@ public final class PlayerStateListener implements Listener {
     private void checkExitViaTeleport(final PlayerTeleportEvent event) {
         final Location to = event.getTo();
         if (to == null) {
+            return;
+        }
+        if (!query.usesFlag(event.getFrom().getWorld(), Flags.EXIT_VIA_TELEPORT)) {
             return;
         }
         final Player player = event.getPlayer();
@@ -198,9 +223,10 @@ public final class PlayerStateListener implements Listener {
         final Material type = block.getType();
         if (type == Material.RESPAWN_ANCHOR) {
             final ApplicableRegionSet anchorSet = query.getApplicableRegions(block);
-            if (!anchorSet.testBuild(player.getUniqueId(), Flags.RESPAWN_ANCHORS) && !Bypass.has(player)) {
+            if (!anchorSet.testBuild(player.getUniqueId(), Flags.RESPAWN_ANCHORS) && !Bypass.has(player)
+                && !anchorSet.flagSetContains(Flags.ALLOW_INTERACT, Material.RESPAWN_ANCHOR)) {
                 event.setCancelled(true);
-                messages.sendDeny(player, Flags.RESPAWN_ANCHORS, anchorSet.queryValue(Flags.DENY_MESSAGE));
+                messages.sendRegionDeny(player, Flags.RESPAWN_ANCHORS, anchorSet);
             }
             return;
         }
@@ -209,11 +235,11 @@ public final class PlayerStateListener implements Listener {
         }
         final ApplicableRegionSet set = query.getApplicableRegions(block);
         if (!set.testBuild(player.getUniqueId(), Flags.CHEST_ACCESS)) {
-            if (Bypass.has(player)) {
+            if (Bypass.has(player) || set.flagSetContains(Flags.ALLOW_INTERACT, type)) {
                 return;
             }
             event.setCancelled(true);
-            messages.sendDeny(player, Flags.CHEST_ACCESS, set.queryValue(Flags.DENY_MESSAGE));
+            messages.sendRegionDeny(player, Flags.CHEST_ACCESS, set);
         }
     }
 
@@ -285,7 +311,8 @@ public final class PlayerStateListener implements Listener {
         final World world = player.getWorld();
         final boolean invincibility =
             query.usesFlag(world, Flags.INVINCIBLE) || query.usesFlag(world, Flags.GODMODE);
-        final boolean fall = event.getCause() == EntityDamageEvent.DamageCause.FALL
+        final boolean fall = (event.getCause() == EntityDamageEvent.DamageCause.FALL
+            || event.getCause() == EntityDamageEvent.DamageCause.FLY_INTO_WALL)
             && query.usesFlag(world, Flags.FALL_DAMAGE);
         if (!invincibility && !fall) {
             return;

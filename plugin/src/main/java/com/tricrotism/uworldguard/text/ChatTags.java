@@ -24,7 +24,7 @@ public final class ChatTags {
     public void setPrefix(final UUID uuid, final @Nullable String value) {
         if (value == null || value.isBlank()) {
             prefixes.remove(uuid);
-        } else {
+        } else if (!value.equals(prefixes.get(uuid))) {
             prefixes.put(uuid, value);
         }
     }
@@ -32,7 +32,7 @@ public final class ChatTags {
     public void setSuffix(final UUID uuid, final @Nullable String value) {
         if (value == null || value.isBlank()) {
             suffixes.remove(uuid);
-        } else {
+        } else if (!value.equals(suffixes.get(uuid))) {
             suffixes.put(uuid, value);
         }
     }

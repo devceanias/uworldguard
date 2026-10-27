@@ -7,6 +7,7 @@ import com.tricrotism.uworldguard.region.ApplicableRegionSet;
 import com.tricrotism.uworldguard.region.RegionContainerImpl;
 import com.tricrotism.uworldguard.region.RegionQuery;
 import com.tricrotism.uworldguard.text.MessageService;
+import io.papermc.paper.event.entity.EntityKnockbackEvent;
 import io.papermc.paper.event.entity.EntityPushedByEntityAttackEvent;
 import org.bukkit.Material;
 import org.bukkit.World;
@@ -150,32 +151,50 @@ public final class ItemUseListener implements Listener {
         }
     }
 
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    public void onWindChargeThrow(final ProjectileLaunchEvent event) {
+        if (EventGate.disabled(event)) {
+            return;
+        }
+        if (!(event.getEntity() instanceof WindCharge windCharge)
+            || !(windCharge.getShooter() instanceof Player player)
+            || !query.usesFlag(player.getWorld(), Flags.WIND_CHARGE)) {
+            return;
+        }
+        if (!query.testState(player, Flags.WIND_CHARGE)) {
+            if (Bypass.has(player)) {
+                return;
+            }
+            event.setCancelled(true);
+            messages.sendDeny(player, Flags.WIND_CHARGE);
+        }
+    }
+
     /**
-     * Wind-charge knockback. Listens on Paper's current event rather than Bukkit's
-     * {@code EntityKnockbackByEntityEvent}, which is deprecated for removal — and which Paper warns
-     * about at startup because handling it costs performance. Only the base event declares a handler
-     * list, so registering against this parent still receives every push subclass.
+     * Wind-charge knockback, the thrower included, so a charge thrown from outside cannot launch
+     * anyone standing in a deny region. Uses Paper's event because Bukkit's
+     * {@code EntityKnockbackByEntityEvent} is deprecated for removal. Only the base event declares a
+     * handler list, so registering against this parent still receives every push subclass.
+     *
+     * <p>A burst is an explosion, and Paper names whoever caused it as the pusher: the thrower for a
+     * thrown charge, the charge itself only when nobody threw it.
      */
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     public void onWindChargeKnockback(final EntityPushedByEntityAttackEvent event) {
         if (EventGate.disabled(event)) {
             return;
         }
-        if (!(event.getPushedBy() instanceof AbstractWindCharge windCharge)) {
+        final Entity pushedBy = event.getPushedBy();
+        if (event.getCause() != EntityKnockbackEvent.Cause.EXPLOSION
+            || !(pushedBy instanceof Player || pushedBy instanceof AbstractWindCharge)) {
             return;
         }
         final Entity victim = event.getEntity();
-        if (!query.usesFlag(victim.getWorld(), Flags.WIND_CHARGE)) {
+        if (!query.usesFlag(victim.getWorld(), Flags.WIND_CHARGE)
+            || query.testState(victim, Flags.WIND_CHARGE)) {
             return;
         }
-        final ProjectileSource shooter = windCharge.getShooter();
-        if (shooter instanceof Entity thrower && thrower.equals(victim)) {
-            return;
-        }
-        if (query.testState(victim, Flags.WIND_CHARGE)) {
-            return;
-        }
-        if (shooter instanceof Player player && Bypass.has(player)) {
+        if (pushedBy instanceof Player player && Bypass.has(player)) {
             return;
         }
         event.setCancelled(true);

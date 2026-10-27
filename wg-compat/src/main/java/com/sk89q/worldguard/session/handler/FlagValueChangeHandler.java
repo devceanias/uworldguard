@@ -58,19 +58,25 @@ public abstract class FlagValueChangeHandler<T> extends Handler {
         onClearValue(player, set);
     }
 
+    /**
+     * Reports only a real transition, and keeps the new value only when the callback let the move
+     * through, as WorldGuard does. A refused move leaves the old value, so the next attempt is asked
+     * again instead of passing as no change.
+     */
     @Override
-    public boolean onCrossBoundary(final LocalPlayer player, final Location from, final Location to,
-                                   final ApplicableRegionSet toSet, final Set<ProtectedRegion> entered,
-                                   final Set<ProtectedRegion> exited, final MoveType moveType) {
+    public boolean onCrossBoundary(final LocalPlayer player, final Location from, final Location to, final ApplicableRegionSet toSet, final Set<ProtectedRegion> entered, final Set<ProtectedRegion> exited, final MoveType moveType) {
         final T currentValue = toSet.queryValue(player, flag);
         final T previous = lastValue;
-        lastValue = currentValue;
+        final boolean allowed;
         if (currentValue == null) {
-            return onAbsentValue(player, from, to, toSet, previous, moveType);
+            allowed = previous == null || onAbsentValue(player, from, to, toSet, previous, moveType);
+        } else {
+            allowed = currentValue.equals(previous)
+                || onSetValue(player, from, to, toSet, currentValue, previous, moveType);
         }
-        if (currentValue.equals(previous)) {
-            return true;
+        if (allowed) {
+            lastValue = currentValue;
         }
-        return onSetValue(player, from, to, toSet, currentValue, previous, moveType);
+        return allowed;
     }
 }

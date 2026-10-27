@@ -201,54 +201,52 @@ public final class PlayerTickService implements Listener {
 
     /**
      * Applies time-lock / weather-lock client-side, so one player standing in an eternal-night arena
-     * does not change the sky for the whole server. Both reset the moment the flag stops applying,
-     * which is why the reset runs even when the value is absent.
+     * does not change the sky for the whole server. Each half is touched only when its value changed,
+     * and resets the moment its flag stops applying, so a half this service never set (weather another
+     * plugin gave the player, say) is left alone.
      */
     private void lockSky(final Player player, final ApplicableRegionSet regions) {
         final UUID id = player.getUniqueId();
         final String time = regions.queryValue(Flags.TIME_LOCK);
         final String weather = regions.queryValue(Flags.WEATHER_LOCK);
         final SkyLock applied = skyLocks.get(id);
-        if (time == null && weather == null) {
-            if (applied == null) {
-                return;
-            }
-            skyLocks.remove(id);
-            if (applied.time() != null) {
+        final boolean timeChanged = !Objects.equals(applied == null ? null : applied.time(), time);
+        final boolean weatherChanged = !Objects.equals(applied == null ? null : applied.weather(), weather);
+        if (!timeChanged && !weatherChanged) {
+            return;
+        }
+
+        if (timeChanged) {
+            if (time == null) {
                 player.resetPlayerTime();
+            } else {
+                final Long ticks = parseTime(time);
+                if (ticks != null) {
+                    player.setPlayerTime(ticks, false);
+                }
             }
-            if (applied.weather() != null) {
+        }
+
+        if (weatherChanged) {
+            if (weather == null) {
                 player.resetPlayerWeather();
-            }
-            return;
-        }
-        if (applied != null && Objects.equals(applied.time(), time)
-            && Objects.equals(applied.weather(), weather)) {
-            return;
-        }
-
-        if (time == null) {
-            player.resetPlayerTime();
-        } else {
-            final Long ticks = parseTime(time);
-            if (ticks != null) {
-                player.setPlayerTime(ticks, false);
+            } else {
+                final WeatherType type = switch (weather.trim().toLowerCase(Locale.ROOT)) {
+                    case "clear", "sun", "sunny" -> WeatherType.CLEAR;
+                    case "downfall", "rain", "storm", "thunder" -> WeatherType.DOWNFALL;
+                    default -> null;
+                };
+                if (type != null) {
+                    player.setPlayerWeather(type);
+                }
             }
         }
 
-        if (weather == null) {
-            player.resetPlayerWeather();
+        if (time == null && weather == null) {
+            skyLocks.remove(id);
         } else {
-            final WeatherType type = switch (weather.trim().toLowerCase(Locale.ROOT)) {
-                case "clear", "sun", "sunny" -> WeatherType.CLEAR;
-                case "downfall", "rain", "storm", "thunder" -> WeatherType.DOWNFALL;
-                default -> null;
-            };
-            if (type != null) {
-                player.setPlayerWeather(type);
-            }
+            skyLocks.put(id, new SkyLock(time, weather));
         }
-        skyLocks.put(id, new SkyLock(time, weather));
     }
 
     private static @Nullable Long parseTime(final String raw) {

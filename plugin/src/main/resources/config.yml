@@ -35,6 +35,40 @@ interaction:
     #    - NOTE_BLOCK
     #    - ANVIL
 
+# Items and blocks restricted everywhere, region or not, as WorldGuard's blacklist does. Entries here
+# apply in every world. A world's own entries go under worlds.<name>.blacklist (see below) and add to
+# these. Also editable in game with /uwg blacklist.
+#   items:          materials the entry covers (lava_bucket, tnt, ...).
+#   on-<rule>:      what to do. Rules: on-break, on-place, on-interact, on-use, on-drop, on-acquire
+#                   (pick up or take from an inventory), on-equip, on-destroy-with (break a block while
+#                   holding it), on-dispense.
+#                   Actions: deny, allow, tell (tell the player), notify (staff with
+#                   uworldguard.blacklist.notify), log, kick, ban.
+#   ignore-perms:   players with any of these permissions are left alone.
+#   ignore-groups:  same, by group. Checked as the permission group.<name>, which LuckPerms grants.
+#   message:        text for tell, kick and ban instead of the defaults in messages.yml. MiniMessage,
+#                   <item> and <action> are filled in.
+#   comment:        shown to staff and written to the log.
+# Each player is told, notified about and logged at most once per rule every 3 seconds. Refusing
+# still happens every time.
+blacklist:
+    # true: a listed item refuses every rule that does not say allow. Unlisted items are left alone.
+    use-as-whitelist: false
+    logging:
+        console: true
+        # Daily files in plugins/uWorldGuard/logs/, written in the background.
+        file: true
+    entries: [ ]
+    #entries:
+    #    - items: [ lava_bucket, water_bucket ]
+    #      ignore-perms: [ spawn.builder ]
+    #      ignore-groups: [ admin ]
+    #      on-use: [ deny, tell, log ]
+    #      message: "<red>No buckets here."
+    #    - items: [ tnt ]
+    #      on-place: [ deny, notify, kick ]
+    #      comment: "TNT"
+
 # How entering and leaving regions is detected. This is uWorldGuard's busiest work.
 movement:
     # EVENT: checks every player movement.
@@ -59,11 +93,17 @@ movement:
 #                this is a real saving in minigame or creative worlds another plugin manages.
 #                whitelist-mode: true flips it to "handle only the listed events".
 #   interaction: extra whitelisted blocks for that world, added to the global list above.
+#   blacklist:   entries for that world, added to the global ones, and its own use-as-whitelist.
 #worlds:
 #    minigames:
 #        interaction:
 #            whitelist:
 #                - NOTE_BLOCK
+#        blacklist:
+#            use-as-whitelist: false
+#            entries:
+#                - items: [ elytra ]
+#                  on-equip: [ deny, tell ]
 #        events:
 #            whitelist-mode: false
 #            disabled:
@@ -95,6 +135,6 @@ regions:
 #   "":     report the emulated WorldGuard version. Keeps those hooks working.
 #   "none": report uWorldGuard's own version. Those plugins may then refuse to hook.
 #   "7.x.y": report a specific version. Use a real WorldGuard release.
-# The update checker and bStats always use the real version.
+# The update checker, bStats and spark always see the real version.
 compatibility:
     report-version: ""

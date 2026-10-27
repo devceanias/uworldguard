@@ -26,10 +26,11 @@ public final class RegionContainerImpl implements RegionContainer {
     /**
      * A loaded world's regions together with the name they persist under. The name is held rather
      * than resolved: the autosave runs on the async scheduler, and {@code Bukkit.getWorld(uid)} walks
-     * the server's world map, which is not concurrent — a world loading or unloading mid-sweep could
-     * take the save down with a {@code ConcurrentModificationException}.
+     * the server's world map, which is not concurrent. A world loading or unloading mid-sweep could
+     * take the save down with a {@code ConcurrentModificationException}. The world is held so
+     * {@link #get} can find it by reference. Nothing calls into it off its thread.
      */
-    private record Loaded(String name, RegionManager manager) {}
+    private record Loaded(World world, String name, RegionManager manager) {}
 
     private final Plugin plugin;
     private final RegionStore store;
@@ -41,6 +42,11 @@ public final class RegionContainerImpl implements RegionContainer {
      * array allocates nothing.
      */
     private volatile RegionManager[] managers = new RegionManager[0];
+    /**
+     * {@link #loaded} again, for {@link #get} to scan by reference. Every query resolves its world
+     * first, and comparing a handful of references is cheaper than hashing a UUID.
+     */
+    private volatile Loaded[] byWorld = new Loaded[0];
     private final Set<String> failedLoads = ConcurrentHashMap.newKeySet();
     /**
      * Worlds whose async populate is still in flight. The publish at the end of {@link #load} claims
@@ -128,7 +134,7 @@ public final class RegionContainerImpl implements RegionContainer {
             }
             manager.clearDirty();
             manager.uwgUseIndex(store.index(name, manager));
-            loaded.put(world.getUID(), new Loaded(name, manager));
+            loaded.put(world.getUID(), new Loaded(world, name, manager));
             republishManagers();
             warnAboutUnenforcedGroups(name, manager);
             Bukkit.getPluginManager().callEvent(new RegionsLoadedEvent(world, manager));
@@ -172,7 +178,7 @@ public final class RegionContainerImpl implements RegionContainer {
                 return;
             }
             manager.uwgUseIndex(store.index(name, manager));
-            loaded.put(uid, new Loaded(name, manager));
+            loaded.put(uid, new Loaded(world, name, manager));
             republishManagers();
             FlagLifecycle.resolvePending(manager);
             warnAboutUnenforcedGroups(name, manager);
@@ -264,7 +270,7 @@ public final class RegionContainerImpl implements RegionContainer {
         loaded.forEach((_, world) -> {
             final RegionManager manager = world.manager();
             if (manager.clearDirty()) {
-                saveAsync(world.name(), manager, manager::markDirty);
+                saveAsync(world.name(), manager, manager::uwgMarkUnsaved);
             }
         });
     }
@@ -331,6 +337,12 @@ public final class RegionContainerImpl implements RegionContainer {
 
     @Override
     public @Nullable RegionManager get(final World world) {
+        final Loaded[] snapshot = byWorld;
+        for (int i = 0; i < snapshot.length; i++) {
+            if (snapshot[i].world() == world) {
+                return snapshot[i].manager();
+            }
+        }
         final Loaded found = loaded.get(world.getUID());
         return found == null ? null : found.manager();
     }
@@ -367,11 +379,13 @@ public final class RegionContainerImpl implements RegionContainer {
      * loads and unloads are rare enough that rebuilding beats keeping the two in step incrementally.
      */
     private void republishManagers() {
-        final List<RegionManager> snapshot = new ArrayList<>(loaded.size());
-        for (final Loaded world : loaded.values()) {
-            snapshot.add(world.manager());
+        final List<Loaded> worlds = new ArrayList<>(loaded.values());
+        final RegionManager[] snapshot = new RegionManager[worlds.size()];
+        for (int i = 0; i < snapshot.length; i++) {
+            snapshot[i] = worlds.get(i).manager();
         }
-        managers = snapshot.toArray(new RegionManager[0]);
+        managers = snapshot;
+        byWorld = worlds.toArray(new Loaded[0]);
     }
 
     @Override

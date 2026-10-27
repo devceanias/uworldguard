@@ -87,9 +87,16 @@ public final class SessionDispatch {
     private SessionDispatch() {
     }
 
+    /**
+     * Runs on every new session, and after the first both fields already hold these values.
+     */
     static void install(final Sink installed) {
-        sink = installed;
-        TRACKING = true;
+        if (sink != installed) {
+            sink = installed;
+        }
+        if (!TRACKING) {
+            TRACKING = true;
+        }
     }
 
     public static @Nullable Location testMove(

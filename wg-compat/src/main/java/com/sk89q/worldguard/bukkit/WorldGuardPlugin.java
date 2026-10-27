@@ -102,7 +102,7 @@ public class WorldGuardPlugin extends org.bukkit.plugin.java.JavaPlugin {
     }
 
     public ProtectionQuery createProtectionQuery() {
-        return new ProtectionQuery();
+        return ProtectionQuery.UWG_SHARED;
     }
 
     /**
@@ -181,7 +181,7 @@ public class WorldGuardPlugin extends org.bukkit.plugin.java.JavaPlugin {
             return fromJar;
         }
         final String descriptor = "name: WorldGuard\n"
-            + "version: '" + getPluginMeta().getVersion() + "'\n"
+            + "version: '" + getDescription().getVersion() + "'\n"
             + "main: com.sk89q.worldguard.bukkit.WorldGuardPlugin\n"
             + "api-version: '1.13'\n";
         return new ByteArrayInputStream(descriptor.getBytes(StandardCharsets.UTF_8));

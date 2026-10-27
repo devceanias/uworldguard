@@ -5,9 +5,9 @@
 
 package com.sk89q.worldguard.bukkit;
 
-import com.sk89q.worldedit.bukkit.BukkitAdapter;
 import com.sk89q.worldguard.bukkit.cause.Cause;
 import com.sk89q.worldguard.domains.Association;
+import com.sk89q.worldguard.protection.ApplicableRegionSet;
 import com.sk89q.worldguard.protection.association.Associables;
 import com.sk89q.worldguard.protection.association.RegionAssociable;
 import com.sk89q.worldguard.protection.flags.Flags;
@@ -18,6 +18,7 @@ import com.tricrotism.uworldguard.wgcompat.WgCompatBridge;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.Tag;
+import org.bukkit.World;
 import org.bukkit.block.Block;
 import org.bukkit.entity.*;
 
@@ -41,6 +42,12 @@ public class ProtectionQuery {
         Material.BREWING_STAND, Material.CHISELED_BOOKSHELF, Material.CRAFTER, Material.DECORATED_POT,
         Material.LECTERN, Material.JUKEBOX);
 
+    /**
+     * Internal: the instance {@code WorldGuardPlugin.createProtectionQuery()} hands out. This class
+     * holds no state, so a fresh object per call gains nothing.
+     */
+    public static final ProtectionQuery UWG_SHARED = new ProtectionQuery();
+
     public ProtectionQuery() {
     }
 
@@ -49,7 +56,7 @@ public class ProtectionQuery {
     }
 
     public boolean testBlockBreak(final Object cause, final Block block) {
-        return testBuild(cause, block.getLocation(), Flags.BLOCK_BREAK);
+        return testBuild(cause, block.getWorld(), block.getX(), block.getY(), block.getZ(), Flags.BLOCK_BREAK);
     }
 
     public boolean testBlockInteract(final Object cause, final Block block) {
@@ -57,7 +64,8 @@ public class ProtectionQuery {
         final boolean container = CONTAINERS.contains(type)
             || Tag.SHULKER_BOXES.isTagged(type)
             || Tag.COPPER_CHESTS.isTagged(type);
-        return testBuild(cause, block.getLocation(), container ? Flags.CHEST_ACCESS : Flags.USE);
+        return testBuild(cause, block.getWorld(), block.getX(), block.getY(), block.getZ(),
+            container ? Flags.CHEST_ACCESS : Flags.USE);
     }
 
     public boolean testEntityPlace(final Object cause, final Location location, final EntityType type) {
@@ -85,38 +93,47 @@ public class ProtectionQuery {
             return true;
         }
         final Location location = entity.getLocation();
-        if (location.getWorld() == null) {
+        final World world = location.getWorld();
+        if (world == null) {
             return true;
         }
-        final Player player = Cause.create(cause).getFirstPlayer();
+        final Player player = cause instanceof Player p ? p : Cause.create(cause).getFirstPlayer();
         if (player != null && WgCompatBridge.hasBypass(player)) {
             return true;
         }
-        final com.sk89q.worldedit.util.Location target = BukkitAdapter.adapt(location);
+        final ApplicableRegionSet set = RegionQuery.uwgApplicableRegions(world,
+            location.getBlockX(), location.getBlockY(), location.getBlockZ());
         final RegionAssociable subject = subject(player);
         if (entity instanceof Player) {
-            return RegionQuery.UWG_SHARED.queryState(target, subject, Flags.PVP) != StateFlag.State.DENY;
+            return set.queryState(subject, Flags.PVP) != StateFlag.State.DENY;
         }
         if (entity instanceof Animals) {
-            return RegionQuery.UWG_SHARED.testBuild(target, subject, Flags.DAMAGE_ANIMALS);
+            return RegionQuery.uwgTestBuild(set, subject, Flags.DAMAGE_ANIMALS);
         }
-        return RegionQuery.UWG_SHARED.testBuild(target, subject);
+        return RegionQuery.uwgTestBuild(set, subject);
     }
 
     private static boolean testBuild(final Object cause, final Location location, final StateFlag flag) {
-        if (location == null || location.getWorld() == null) {
+        if (location == null) {
             return true;
         }
-        final Player player = Cause.create(cause).getFirstPlayer();
+        return testBuild(cause, location.getWorld(), location.getBlockX(), location.getBlockY(),
+            location.getBlockZ(), flag);
+    }
+
+    private static boolean testBuild(
+        final Object cause, final World world, final int x, final int y, final int z, final StateFlag flag
+    ) {
+        if (world == null) {
+            return true;
+        }
+        final Player player = cause instanceof Player p ? p : Cause.create(cause).getFirstPlayer();
         if (player != null && WgCompatBridge.hasBypass(player)) {
             return true;
         }
-        return RegionQuery.UWG_SHARED.testBuild(BukkitAdapter.adapt(location), subject(player), flag);
+        return RegionQuery.uwgTestBuild(RegionQuery.uwgApplicableRegions(world, x, y, z), subject(player), flag);
     }
 
-    // simplified: a non-player cause is treated as a non-member everywhere. WorldGuard associates a
-    // block or entity cause with the regions at its origin; if a consumer needs that, resolve the
-    // origin's regions and pass a RegionOverlapAssociation.
     private static RegionAssociable subject(final Player player) {
         if (player == null) {
             return Associables.constant(Association.NON_MEMBER);

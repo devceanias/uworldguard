@@ -2,6 +2,7 @@ package com.tricrotism.uworldguard.integration;
 
 import com.tricrotism.uworldguard.flags.Flags;
 import com.tricrotism.uworldguard.wgcompat.SessionBridge;
+import com.tricrotism.uworldguard.wgcompat.WgCompatBridge;
 import org.bukkit.Bukkit;
 import org.bukkit.plugin.Plugin;
 import org.bukkit.plugin.PluginManager;
@@ -176,7 +177,8 @@ public final class HotSwap {
 
     private static boolean ownsFlagsOrHandlers(final Plugin plugin) {
         final ClassLoader loader = plugin.getClass().getClassLoader();
-        return !Flags.ownedBy(loader).isEmpty() || SessionBridge.INSTANCE.hasHandlersOwnedBy(loader);
+        return !Flags.ownedBy(loader).isEmpty()
+            || WgCompatBridge.active() && SessionBridge.INSTANCE.hasHandlersOwnedBy(loader);
     }
 
     private static int indexOf(final Plugin[] plugins, final Plugin plugin) {

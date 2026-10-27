@@ -81,7 +81,7 @@ class ArenaReportTest {
         final MessageService messages = new MessageService(plugin);
         final RegionQuery query = container.createQuery();
         build = new BuildProtectionListener(query, messages);
-        workbench = new WorkbenchListener(query, messages);
+        workbench = new WorkbenchListener(container, query, messages);
         state = new PlayerStateListener(query, messages);
         movement = new MovementListener(plugin, query, messages, new CollisionService(plugin),
             new ChamberedPearlTracker(plugin), new ChatTags(), new PendingRestores(plugin), new Settings());

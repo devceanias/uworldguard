@@ -40,7 +40,317 @@ public final class RegionSerializer {
      */
     private static final Logger LOG = Logger.getLogger("uWorldGuard");
 
+    /**
+     * The document, written out directly rather than built as Bukkit sections for SnakeYAML to dump.
+     * A value only a YAML library can write, which only another plugin's flag can hold, sends the
+     * whole document down the SnakeYAML path.
+     */
     public String toYaml(final RegionManager manager) {
+        final String text = streamed(manager);
+        return text != null ? text : toYamlTree(manager);
+    }
+
+    /**
+     * The document as {@link #toYaml} streams it, or {@code null} when a value needs a YAML library.
+     */
+    @Nullable String streamed(final RegionManager manager) {
+        final Collection<ProtectedRegion> regions = manager.getRegions();
+        final StringBuilder out = new StringBuilder(64 + regions.size() * 320);
+        out.append("regions:");
+        int written = 0;
+        try {
+            for (final ProtectedRegion region : regions) {
+                key(out, 2, region.getId());
+                writeRegion(out, region, 4);
+                written++;
+            }
+        } catch (final Unwritable e) {
+            return null;
+        }
+        return out.append(written == 0 ? " {}\n" : "\n").toString();
+    }
+
+    /**
+     * A value the streamed writer leaves to a YAML library.
+     */
+    private static final class Unwritable extends RuntimeException {
+        Unwritable() {
+            super(null, null, false, false);
+        }
+    }
+
+    private void writeRegion(final StringBuilder out, final ProtectedRegion region, final int indent) {
+        writeShape(out, region, indent);
+        key(out, indent, "priority").append(' ').append(region.getPriority());
+        final ProtectedRegion parent = region.getParent();
+        if (parent != null) {
+            key(out, indent, "parent").append(' ');
+            string(out, parent.getId());
+        }
+        key(out, indent, "owners");
+        writeDomain(out, region.getOwners(), indent + 2);
+        key(out, indent, "members");
+        writeDomain(out, region.getMembers(), indent + 2);
+        key(out, indent, "flags");
+        final Map<String, Object> unresolved = region.getUnresolvedFlags();
+        final Map<Flag<?>, Object> flags = region.getFlags();
+        final Map<Flag<?>, RegionGroup> groups = region.getFlagGroups();
+        if (unresolved.isEmpty() && flags.isEmpty() && groups.isEmpty()) {
+            out.append(" {}");
+            return;
+        }
+        for (final Map.Entry<String, Object> e : unresolved.entrySet()) {
+            final Flag<?> named = Flags.get(e.getKey());
+            if (named != null && flags.containsKey(named)) {
+                throw new Unwritable();
+            }
+            key(out, indent + 2, e.getKey());
+            value(out, e.getValue(), indent + 2);
+        }
+        for (final Map.Entry<Flag<?>, Object> e : flags.entrySet()) {
+            key(out, indent + 2, e.getKey().getName());
+            value(out, marshal(e.getKey(), e.getValue()), indent + 2);
+        }
+        for (final Map.Entry<Flag<?>, RegionGroup> e : groups.entrySet()) {
+            key(out, indent + 2, e.getKey().getName() + "-group").append(' ');
+            string(out, e.getValue().serialized());
+        }
+    }
+
+    private void writeShape(final StringBuilder out, final ProtectedRegion region, final int indent) {
+        key(out, indent, "type").append(' ').append(region.getType().name().toLowerCase(Locale.ROOT));
+        switch (region) {
+            case ProtectedCuboidRegion c -> {
+                vec(out, indent, "min", c.getMinimumPoint());
+                vec(out, indent, "max", c.getMaximumPoint());
+            }
+            case ProtectedPolygonRegion p -> {
+                key(out, indent, "points");
+                if (p.getPoints().isEmpty()) {
+                    out.append(" []");
+                }
+                for (final BlockVector3 v : p.getPoints()) {
+                    item(out, indent).append(v.x()).append(',').append(v.z());
+                }
+                key(out, indent, "min-y").append(' ').append(p.getMinimumPoint().y());
+                key(out, indent, "max-y").append(' ').append(p.getMaximumPoint().y());
+            }
+            case ProtectedCylinderRegion cy -> {
+                final BlockVector3 min = cy.getMinimumPoint();
+                final BlockVector3 max = cy.getMaximumPoint();
+                key(out, indent, "center-x").append(' ').append((min.x() + max.x()) / 2);
+                key(out, indent, "center-z").append(' ').append((min.z() + max.z()) / 2);
+                key(out, indent, "radius-x").append(' ').append((max.x() - min.x()) / 2);
+                key(out, indent, "radius-z").append(' ').append((max.z() - min.z()) / 2);
+                key(out, indent, "min-y").append(' ').append(min.y());
+                key(out, indent, "max-y").append(' ').append(max.y());
+            }
+            case ProtectedSphereRegion s -> {
+                final BlockVector3 min = s.getMinimumPoint();
+                final BlockVector3 max = s.getMaximumPoint();
+                key(out, indent, "center-x").append(' ').append((min.x() + max.x()) / 2);
+                key(out, indent, "center-y").append(' ').append((min.y() + max.y()) / 2);
+                key(out, indent, "center-z").append(' ').append((min.z() + max.z()) / 2);
+                key(out, indent, "radius-x").append(' ').append((max.x() - min.x()) / 2);
+                key(out, indent, "radius-y").append(' ').append((max.y() - min.y()) / 2);
+                key(out, indent, "radius-z").append(' ').append((max.z() - min.z()) / 2);
+            }
+            case ProtectedPolyhedronRegion p -> {
+                key(out, indent, "points");
+                if (p.getPoints().isEmpty()) {
+                    out.append(" []");
+                }
+                for (final BlockVector3 v : p.getPoints()) {
+                    item(out, indent).append(v.x()).append(',').append(v.y()).append(',').append(v.z());
+                }
+            }
+            case ProtectedCompositeRegion c -> {
+                key(out, indent, "parts");
+                shapes(out, c.getParts(), indent + 2);
+            }
+            case ProtectedCarvedRegion c -> {
+                key(out, indent, "solid");
+                writeShape(out, c.getSolid(), indent + 2);
+                key(out, indent, "holes");
+                shapes(out, c.getHoles(), indent + 2);
+            }
+            default -> { /* global has no geometry */ }
+        }
+    }
+
+    private void shapes(final StringBuilder out, final Map<String, ? extends ProtectedRegion> shapes, final int indent) {
+        if (shapes.isEmpty()) {
+            out.append(" {}");
+            return;
+        }
+        for (final Map.Entry<String, ? extends ProtectedRegion> e : shapes.entrySet()) {
+            key(out, indent, e.getKey());
+            writeShape(out, e.getValue(), indent + 2);
+        }
+    }
+
+    private static void vec(final StringBuilder out, final int indent, final String key, final BlockVector3 v) {
+        key(out, indent, key);
+        item(out, indent).append(v.x());
+        item(out, indent).append(v.y());
+        item(out, indent).append(v.z());
+    }
+
+    private static void writeDomain(final StringBuilder out, final DefaultDomain domain, final int indent) {
+        key(out, indent, "players");
+        final Set<UUID> players = domain.getPlayers();
+        if (players.isEmpty()) {
+            out.append(" []");
+        }
+        for (final UUID uuid : players) {
+            item(out, indent).append(uuid);
+        }
+        key(out, indent, "groups");
+        final Set<String> groups = domain.getGroups();
+        if (groups.isEmpty()) {
+            out.append(" []");
+        }
+        for (final String group : groups) {
+            string(item(out, indent), group);
+        }
+    }
+
+    private static StringBuilder key(final StringBuilder out, final int indent, final String name) {
+        indent(out.append('\n'), indent);
+        string(out, name);
+        return out.append(':');
+    }
+
+    /**
+     * A list item sits at its key's own indent, as Bukkit writes block lists.
+     */
+    private static StringBuilder item(final StringBuilder out, final int indent) {
+        return indent(out.append('\n'), indent).append("- ");
+    }
+
+    private static StringBuilder indent(final StringBuilder out, final int indent) {
+        for (int i = 0; i < indent; i++) {
+            out.append(' ');
+        }
+        return out;
+    }
+
+    private static void value(final StringBuilder out, final @Nullable Object value, final int indent) {
+        if (value instanceof Map<?, ?> map) {
+            boolean any = false;
+            for (final Map.Entry<?, ?> e : map.entrySet()) {
+                if (e.getValue() != null) {
+                    key(out, indent + 2, String.valueOf(e.getKey()));
+                    value(out, e.getValue(), indent + 2);
+                    any = true;
+                }
+            }
+            if (!any) {
+                out.append(" {}");
+            }
+        } else if (value instanceof List<?> list) {
+            if (list.isEmpty()) {
+                out.append(" []");
+            }
+            for (final Object element : list) {
+                if (element == null || element instanceof Map || element instanceof Collection) {
+                    throw new Unwritable();
+                }
+                scalar(item(out, indent), element);
+            }
+        } else if (value != null) {
+            scalar(out.append(' '), value);
+        } else {
+            throw new Unwritable();
+        }
+    }
+
+    private static void scalar(final StringBuilder out, final Object value) {
+        if (value instanceof String s) {
+            string(out, s);
+        } else if (value instanceof Integer || value instanceof Long || value instanceof Short || value instanceof Byte) {
+            out.append(((Number) value).longValue());
+        } else if (value instanceof Double || value instanceof Float) {
+            final double d = ((Number) value).doubleValue();
+            if (Double.isNaN(d)) {
+                out.append(".NaN");
+            } else if (Double.isInfinite(d)) {
+                out.append(d > 0 ? ".inf" : "-.inf");
+            } else {
+                out.append(value);
+            }
+        } else if (value instanceof Boolean b) {
+            out.append(b.booleanValue());
+        } else {
+            throw new Unwritable();
+        }
+    }
+
+    /**
+     * Writes {@code s} plain when it cannot read back as anything else, double quoted otherwise.
+     */
+    private static void string(final StringBuilder out, final String s) {
+        if (plainSafe(s)) {
+            out.append(s);
+            return;
+        }
+        out.append('"');
+        for (int i = 0, n = s.length(); i < n; i++) {
+            final char c = s.charAt(i);
+            switch (c) {
+                case '"' -> out.append("\\\"");
+                case '\\' -> out.append("\\\\");
+                case '\n' -> out.append("\\n");
+                case '\t' -> out.append("\\t");
+                case '\r' -> out.append("\\r");
+                default -> {
+                    if (c < 0x20 || c == 0x7F || c == '\u0085' || c == ' ' || c == ' ' || c == '﻿') {
+                        out.append(String.format(Locale.ROOT, "\\u%04x", (int) c));
+                    } else {
+                        out.append(c);
+                    }
+                }
+            }
+        }
+        out.append('"');
+    }
+
+    private static boolean plainSafe(final String s) {
+        final int n = s.length();
+        if (n == 0) {
+            return false;
+        }
+        final char first = s.charAt(0);
+        if (!(first >= 'a' && first <= 'z' || first >= 'A' && first <= 'Z' || first == '<' || first == '_')) {
+            return false;
+        }
+        // << is YAML 1.1's merge key
+        if (first == '<' && n > 1 && s.charAt(1) == '<') {
+            return false;
+        }
+        if (s.charAt(n - 1) == ' ') {
+            return false;
+        }
+        for (int i = 1; i < n; i++) {
+            final char c = s.charAt(i);
+            if (c < 0x20 || c > 0x7E || c == ':' || c == '#' || c == '"' || c == '\'' || c == ','
+                || c == '[' || c == ']' || c == '{' || c == '}' || c == '\\') {
+                return false;
+            }
+        }
+        return !YAML_WORDS.contains(s.toLowerCase(Locale.ROOT));
+    }
+
+    /**
+     * Plain words YAML 1.1 reads as a boolean or null, in lower case.
+     */
+    private static final Set<String> YAML_WORDS = Set.of("y", "n", "yes", "no", "true", "false", "on", "off", "null");
+
+    /**
+     * The document built as Bukkit sections and dumped by SnakeYAML: what {@link #toYaml} falls back
+     * to, and what the streamed writer is checked against.
+     */
+    String toYamlTree(final RegionManager manager) {
         final YamlConfiguration yaml = new YamlConfiguration();
         yaml.options().pathSeparator(SEPARATOR);
         final ConfigurationSection root = yaml.createSection("regions");

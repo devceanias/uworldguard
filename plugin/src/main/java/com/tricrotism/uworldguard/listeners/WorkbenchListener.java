@@ -6,6 +6,7 @@ import com.tricrotism.uworldguard.flags.Flags;
 import com.tricrotism.uworldguard.flags.State;
 import com.tricrotism.uworldguard.flags.StateFlag;
 import com.tricrotism.uworldguard.region.ApplicableRegionSet;
+import com.tricrotism.uworldguard.region.RegionContainerImpl;
 import com.tricrotism.uworldguard.region.RegionQuery;
 import com.tricrotism.uworldguard.text.MessageService;
 import org.bukkit.Material;
@@ -26,7 +27,11 @@ import java.util.UUID;
 
 /**
  * {@code permit-workbenches} blocks opening work-stations (crafting table, anvils, ender chest, …)
- * and 3×3 crafting-table crafting; {@code inventory-craft} blocks 2×2 inventory crafting.
+ * and 3×3 crafting-table crafting. {@code inventory-craft} blocks 2×2 inventory crafting.
+ *
+ * <p>Opening only refuses on an explicit deny. Membership is already enforced by the
+ * {@code interact}/{@code use} check in {@link BuildProtectionListener}, which runs first, so an
+ * unset flag defers to it and {@code use: allow} opens a smithing table for everyone.
  */
 @NullMarked
 public final class WorkbenchListener implements Listener {
@@ -34,10 +39,12 @@ public final class WorkbenchListener implements Listener {
     private static final Set<Material> ANVILS = EnumSet.of(
         Material.ANVIL, Material.CHIPPED_ANVIL, Material.DAMAGED_ANVIL);
 
+    private final RegionContainerImpl container;
     private final RegionQuery query;
     private final MessageService messages;
 
-    public WorkbenchListener(final RegionQuery query, final MessageService messages) {
+    public WorkbenchListener(final RegionContainerImpl container, final RegionQuery query, final MessageService messages) {
+        this.container = container;
         this.query = query;
         this.messages = messages;
     }
@@ -50,29 +57,34 @@ public final class WorkbenchListener implements Listener {
         if (event.getAction() != Action.RIGHT_CLICK_BLOCK || event.getHand() != EquipmentSlot.HAND) {
             return;
         }
+        if (!container.anyRegionUses(Flags.PERMIT_WORKBENCHES) && !container.anyRegionUses(Flags.USE_ANVIL)) {
+            return;
+        }
         final Block block = event.getClickedBlock();
-        if (block == null || !InteractFlags.WORKBENCHES.contains(block.getType())) {
+        if (block == null) {
+            return;
+        }
+        final Material type = block.getType();
+        if (!InteractFlags.WORKBENCHES.contains(type)) {
             return;
         }
         final Player player = event.getPlayer();
         final UUID uuid = player.getUniqueId();
         final ApplicableRegionSet set = query.getApplicableRegions(block);
         final StateFlag denied;
-        final State anvil = ANVILS.contains(block.getType())
+        final State anvil = ANVILS.contains(type)
             ? set.queryExplicitState(Flags.USE_ANVIL, uuid) : null;
         if (anvil == State.ALLOW) {
             return;
         }
         if (anvil == State.DENY) {
             denied = Flags.USE_ANVIL;
-        } else if (block.getType() == Material.ENDER_CHEST
-            ? set.queryExplicitState(Flags.PERMIT_WORKBENCHES, uuid) == State.DENY
-            : !set.testBuild(uuid, Flags.PERMIT_WORKBENCHES)) {
+        } else if (set.queryExplicitState(Flags.PERMIT_WORKBENCHES, uuid) == State.DENY) {
             denied = Flags.PERMIT_WORKBENCHES;
         } else {
             return;
         }
-        if (Bypass.has(player)) {
+        if (Bypass.has(player) || set.flagSetContains(Flags.ALLOW_INTERACT, type)) {
             return;
         }
         event.setCancelled(true);

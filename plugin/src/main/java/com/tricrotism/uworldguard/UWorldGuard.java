@@ -1,13 +1,13 @@
 package com.tricrotism.uworldguard;
 
+import com.tricrotism.uworldguard.blacklist.BlacklistService;
+import com.tricrotism.uworldguard.commands.BlacklistCommands;
 import com.tricrotism.uworldguard.commands.CompatCommands;
 import com.tricrotism.uworldguard.commands.RegionCommands;
 import com.tricrotism.uworldguard.config.*;
 import com.tricrotism.uworldguard.gui.ChatInputListener;
 import com.tricrotism.uworldguard.gui.ChatInputService;
-import com.tricrotism.uworldguard.integration.BStats;
-import com.tricrotism.uworldguard.integration.HotSwap;
-import com.tricrotism.uworldguard.integration.ReportedVersion;
+import com.tricrotism.uworldguard.integration.*;
 import com.tricrotism.uworldguard.listeners.*;
 import com.tricrotism.uworldguard.migration.MigrationCommands;
 import com.tricrotism.uworldguard.packet.PacketHooks;
@@ -52,11 +52,13 @@ public final class UWorldGuard extends com.sk89q.worldguard.bukkit.WorldGuardPlu
     private @Nullable RegionStore store;
     private @Nullable MetricsBase metrics;
     private volatile @Nullable ScheduledTask autoSaveTask;
+    private long autoSavePeriod;
     private volatile @Nullable ScheduledTask messageExpiryTask;
     private @Nullable FlagLifecycle flagLifecycle;
     private @Nullable PlayerTickService playerTick;
     private @Nullable ChunkUnloadService chunkUnload;
     private @Nullable PendingRestores restores;
+    private @Nullable BlacklistService blacklist;
 
     /**
      * Re-reads {@code config.yml} and applies everything that can change at runtime. Movement mode
@@ -72,6 +74,10 @@ public final class UWorldGuard extends com.sk89q.worldguard.bukkit.WorldGuardPlu
         }
         EventGate.load(getConfig(), getLogger());
         InteractionWhitelist.load(getConfig(), getLogger());
+        final BlacklistService list = this.blacklist;
+        if (list != null) {
+            list.load(getConfig(), getLogger());
+        }
         Messages.expire();
         final MovementListener listener = this.movement;
         if (listener != null && current != null) {
@@ -87,18 +93,25 @@ public final class UWorldGuard extends com.sk89q.worldguard.bukkit.WorldGuardPlu
      * the period once at enable and dropping the handle meant a reload could neither retune it nor
      * start one that had been configured off at boot.
      *
+     * <p>A running task with the same period is kept, since re-arming it would push the next save out
+     * by a full period on every reload.
+     *
      * <p>Synchronized with {@link #cancelAutoSave}: two overlapping {@code /uwg reload}s could each
      * cancel the same old task and each assign a new one, orphaning the first.
      */
     private synchronized void scheduleAutoSave(final Settings settings) {
+        final long period = settings.autoSaveMinutes();
+        if (autoSaveTask != null && period == autoSavePeriod) {
+            return;
+        }
         cancelAutoSave();
         final RegionContainerImpl regionContainer = this.container;
-        final long period = settings.autoSaveMinutes();
         if (period <= 0L || regionContainer == null) {
             return;
         }
         this.autoSaveTask = getServer().getAsyncScheduler().runAtFixedRate(this,
             _ -> regionContainer.saveAll(), period, period, TimeUnit.MINUTES);
+        this.autoSavePeriod = period;
     }
 
     private synchronized void cancelAutoSave() {
@@ -178,6 +191,10 @@ public final class UWorldGuard extends com.sk89q.worldguard.bukkit.WorldGuardPlu
         final ChamberedPearlTracker pearls = new ChamberedPearlTracker(this);
         final ChatInputService chatInput = new ChatInputService();
         final ChatTags chatTags = new ChatTags();
+        final BlacklistService blacklist = new BlacklistService(this, messages);
+        blacklist.load(getConfig(), getLogger());
+        blacklist.start();
+        this.blacklist = blacklist;
 
         final PendingRestores restores = new PendingRestores(this);
         this.restores = restores;
@@ -193,12 +210,17 @@ public final class UWorldGuard extends com.sk89q.worldguard.bukkit.WorldGuardPlu
         getServer().getPluginManager().registerEvents(new NaturalListener(query), this);
         getServer().getPluginManager().registerEvents(new CropTrampleListener(query), this);
         getServer().getPluginManager().registerEvents(new EntityListener(regionContainer, query), this);
-        getServer().getPluginManager().registerEvents(new PlayerStateListener(query, messages), this);
+        final PlayerStateListener playerState = new PlayerStateListener(query, messages);
+        getServer().getPluginManager().registerEvents(playerState, this);
         getServer().getPluginManager().registerEvents(new ItemUseListener(regionContainer, query, messages), this);
         getServer().getPluginManager().registerEvents(new EndCrystalListener(query, messages), this);
-        getServer().getPluginManager().registerEvents(new WorkbenchListener(query, messages), this);
+        getServer().getPluginManager().registerEvents(new WorkbenchListener(regionContainer, query, messages), this);
         getServer().getPluginManager().registerEvents(new DeathListener(query, messages), this);
-        getServer().getPluginManager().registerEvents(new TravelListener(query), this);
+        final TravelListener travel = new TravelListener(query);
+        getServer().getPluginManager().registerEvents(travel, this);
+        if (!CanvasTeleports.register(this, playerState, movement, travel)) {
+            FoliaTeleports.register(this, playerState, movement, travel);
+        }
         getServer().getPluginManager().registerEvents(new PearlListener(regionContainer, pearls), this);
         getServer().getPluginManager().registerEvents(new ChatInputListener(this, chatInput), this);
         final ChunkUnloadService chunkUnload = new ChunkUnloadService(this, regionContainer);
@@ -212,12 +234,14 @@ public final class UWorldGuard extends com.sk89q.worldguard.bukkit.WorldGuardPlu
         getServer().getPluginManager().registerEvents(new VehicleListener(query, messages), this);
         getServer().getPluginManager().registerEvents(new InteractionListener(query, messages), this);
         getServer().getPluginManager().registerEvents(new MachineListener(regionContainer, query, messages), this);
+        getServer().getPluginManager().registerEvents(new BlacklistListener(blacklist), this);
         if (wand != null) {
             getServer().getPluginManager().registerEvents(wand, this);
         }
 
         new RegionCommands(this, regionContainer, selection, chatInput, messages)
-            .register(new MigrationCommands(this, regionContainer), new CompatCommands());
+            .register(new MigrationCommands(this, regionContainer), new CompatCommands(),
+                new BlacklistCommands(this, blacklist));
 
         movement.start();
         movement.replayOnlineRestores();
@@ -404,8 +428,8 @@ public final class UWorldGuard extends com.sk89q.worldguard.bukkit.WorldGuardPlu
         } catch (final RuntimeException | LinkageError e) {
             getLogger().log(Level.SEVERE, "Error while shutting down; saving regions anyway.", e);
         }
-        // Written here as well as in movement.shutdown, which a throw above can skip. The file is
-        // deleted at boot, so a missed write loses every owed game-mode, speed and flight restore.
+        // Outside releaseRuntime so a throw there cannot skip it. The file is deleted at boot, so a
+        // missed write loses every owed game-mode, speed and flight restore.
         final PendingRestores owed = this.restores;
         if (owed != null) {
             this.restores = null;
@@ -442,6 +466,10 @@ public final class UWorldGuard extends com.sk89q.worldguard.bukkit.WorldGuardPlu
         }
         if (restores != null) {
             restores.stop();
+        }
+        if (blacklist != null) {
+            blacklist.stop();
+            blacklist = null;
         }
         if (movement != null) {
             movement.stop();

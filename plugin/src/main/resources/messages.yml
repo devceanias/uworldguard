@@ -24,3 +24,10 @@ messages:
     # Sent to staff with uworldguard.notify for regions using notify-enter / notify-leave.
     notify-enter: "<gray>[<aqua>uWG</aqua>] <white><player></white> entered <aqua><region>"
     notify-leave: "<gray>[<aqua>uWG</aqua>] <white><player></white> left <aqua><region>"
+    # Blacklist. <action> is what was tried (place, use, ...), <item> what it was tried with. An
+    # entry's own message replaces denied, kick and ban.
+    blacklist-denied: "<red>You're not allowed to <action> <item>."
+    # Sent to staff with uworldguard.blacklist.notify. <comment> is the entry's comment, if any.
+    blacklist-notify: "<gray>[<aqua>uWG</aqua>] <white><player></white> tried to <action> <item><comment>"
+    blacklist-kick: "<red>You can't <action> <item>."
+    blacklist-ban: "Banned: you can't <action> <item>."

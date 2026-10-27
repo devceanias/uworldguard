@@ -16,6 +16,7 @@ import org.bukkit.block.BlockState;
 import org.bukkit.event.block.Action;
 import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.block.BlockMultiPlaceEvent;
+import org.bukkit.event.block.BlockPlaceEvent;
 import org.bukkit.event.entity.EntityInteractEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.inventory.EquipmentSlot;
@@ -143,6 +144,31 @@ class BuildProtectionTest {
         region.setFlag(Flags.DENY_BLOCK_BREAK, java.util.Set.of(Material.STONE));
 
         assertFalse(breakBlock(owner, 16, 64, 16));
+    }
+
+    private boolean placeBlock(final PlayerMock player, final Material type, final int x, final int y, final int z) {
+        final Block block = world.getBlockAt(x, y, z);
+        final BlockState before = block.getState();
+        block.setType(type);
+        final BlockPlaceEvent event = new BlockPlaceEvent(block, before, world.getBlockAt(x, y - 1, z),
+            new ItemStack(type), player, true, EquipmentSlot.HAND);
+        listener.onPlace(event);
+        return !event.isCancelled();
+    }
+
+    @Test
+    void thePlaceListsJudgeWhatWasPlaced() {
+        final PlayerMock owner = server.addPlayer();
+        final PlayerMock stranger = server.addPlayer();
+        final ProtectedCuboidRegion region = claim("plot");
+        region.getOwners().addPlayer(owner.getUniqueId());
+        region.setFlag(Flags.DENY_BLOCK_PLACE, java.util.Set.of(Material.TNT));
+        region.setFlag(Flags.ALLOW_BLOCK_PLACE, java.util.Set.of(Material.TORCH));
+
+        assertFalse(placeBlock(owner, Material.TNT, 16, 64, 16), "a denied block is refused even to the owner");
+        assertTrue(placeBlock(owner, Material.STONE, 16, 64, 17));
+        assertTrue(placeBlock(stranger, Material.TORCH, 16, 64, 18), "an allowed block opens the claim");
+        assertFalse(placeBlock(stranger, Material.STONE, 16, 64, 19));
     }
 
     @Test

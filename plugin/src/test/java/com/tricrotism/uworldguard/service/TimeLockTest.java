@@ -7,6 +7,7 @@ import com.tricrotism.uworldguard.region.RegionManager;
 import com.tricrotism.uworldguard.storage.RegionStore;
 import com.tricrotism.uworldguard.util.BlockVector3;
 import org.bukkit.Location;
+import org.bukkit.WeatherType;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -20,7 +21,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * A time-lock stops applying the moment the player is no longer in a region that sets it, including
- * when they leave by changing world.
+ * when they leave by changing world. Each half of the sky is sent only when its own lock changes.
  */
 class TimeLockTest {
 
@@ -83,5 +84,33 @@ class TimeLockTest {
         server.getScheduler().performTicks(20);
 
         assertTrue(player.isPlayerTimeRelative(), "player should follow the world clock again");
+    }
+
+    @Test
+    void enteringATimeOnlyLockLeavesThePlayersWeatherAlone() {
+        player.teleport(new Location(overworld, 0, 64, 0));
+        server.getScheduler().performTicks(20);
+        player.setPlayerWeather(WeatherType.DOWNFALL);
+
+        player.teleport(new Location(spawn, 0, 64, 0));
+        server.getScheduler().performTicks(20);
+
+        assertEquals(11750L, player.getPlayerTime());
+        assertEquals(WeatherType.DOWNFALL, player.getPlayerWeather(), "the region locks only the time");
+    }
+
+    @Test
+    void changingOnlyTheTimeDoesNotResendTheWeather() {
+        locked.setFlag(Flags.WEATHER_LOCK, "rain");
+        server.getScheduler().performTicks(20);
+        assertEquals(WeatherType.DOWNFALL, player.getPlayerWeather());
+        // A marker the service would overwrite if it sent the weather again
+        player.setPlayerWeather(WeatherType.CLEAR);
+
+        locked.setFlag(Flags.TIME_LOCK, "6000");
+        server.getScheduler().performTicks(20);
+
+        assertEquals(6000L, player.getPlayerTime());
+        assertEquals(WeatherType.CLEAR, player.getPlayerWeather(), "the weather lock did not change");
     }
 }

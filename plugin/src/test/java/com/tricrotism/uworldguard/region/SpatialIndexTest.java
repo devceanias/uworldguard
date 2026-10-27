@@ -90,6 +90,38 @@ class SpatialIndexTest {
     }
 
     @Test
+    void aChunkAsksTheIndexOnceUntilAnEdit() {
+        final RegionManager manager = new RegionManager();
+        final EverythingIndex index = new EverythingIndex();
+        manager.uwgUseIndex(index);
+        manager.addRegion(cuboid("spawn", 0, 0, 32, 32));
+
+        manager.getApplicableRegions(20, 64, 20);
+        manager.getApplicableRegions(21, 64, 21);
+        assertEquals(1, manager.getRegionsIntersecting(BlockVector3.at(18, 60, 18), BlockVector3.at(22, 68, 22)).size());
+        assertEquals(1, index.lookups);
+
+        manager.addRegion(cuboid("plot", 16, 16, 24, 24));
+        assertEquals(2, manager.getApplicableRegions(20, 64, 20).size());
+        assertEquals(2, manager.getRegionsIntersecting(BlockVector3.at(18, 60, 18), BlockVector3.at(22, 68, 22)).size());
+    }
+
+    @Test
+    void anEditElsewhereLeavesTheChunkCached() {
+        final RegionManager manager = new RegionManager();
+        final EverythingIndex index = new EverythingIndex();
+        manager.uwgUseIndex(index);
+        manager.addRegion(cuboid("spawn", 0, 0, 32, 32));
+        manager.getApplicableRegions(20, 64, 20);
+
+        manager.addRegion(cuboid("far", 5000, 5000, 5010, 5010));
+        manager.removeRegion("far");
+
+        manager.getApplicableRegions(20, 64, 20);
+        assertEquals(1, index.lookups, "an edit whose box misses the chunk keeps it cached");
+    }
+
+    @Test
     void overReportedCandidatesAreFilteredByContainment() {
         final RegionManager manager = new RegionManager();
         manager.uwgUseIndex(new EverythingIndex());

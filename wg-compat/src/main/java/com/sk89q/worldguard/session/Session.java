@@ -54,6 +54,13 @@ public class Session {
 
     private volatile boolean bypassDisabled;
 
+    /**
+     * Whether a handler given to this session overrides {@link Handler#tick}. While none does, the
+     * once-a-second tick has nothing to run and skips the region lookup. Never cleared, as a stale
+     * {@code true} only costs that shortcut.
+     */
+    private volatile boolean ticks;
+
     public Session(final SessionManager manager) {
         this.manager = manager;
     }
@@ -66,6 +73,43 @@ public class Session {
         synchronized (handlers) {
             handlers.put(handler.getClass(), handler);
             dispatch = handlers.values().toArray(NO_HANDLERS);
+        }
+        final Class<?> type = handler.getClass();
+        if (!anyTestsMoves && overrides(type, "testMoveTo", LocalPlayer.class, Location.class, Location.class,
+            ApplicableRegionSet.class, com.sk89q.worldguard.session.MoveType.class)) {
+            anyTestsMoves = true;
+        }
+        if (!ticks && overrides(type, "tick", LocalPlayer.class, ApplicableRegionSet.class)) {
+            ticks = true;
+        }
+    }
+
+    /**
+     * Whether any session has been given a handler that overrides {@link Handler#testMoveTo}. While none
+     * does, a move that stays in the same regions needs no session. Never cleared, as a stale
+     * {@code true} only costs that shortcut.
+     */
+    private static volatile boolean anyTestsMoves;
+
+    /**
+     * Internal: see {@link #anyTestsMoves}.
+     */
+    public static boolean uwgAnyTestsMoves() {
+        return anyTestsMoves;
+    }
+
+    /**
+     * Internal: see {@link #ticks}.
+     */
+    public boolean uwgTicks() {
+        return ticks;
+    }
+
+    private static boolean overrides(final Class<?> type, final String name, final Class<?>... parameters) {
+        try {
+            return type.getMethod(name, parameters).getDeclaringClass() != Handler.class;
+        } catch (final NoSuchMethodException e) {
+            return true;
         }
     }
 
@@ -117,7 +161,17 @@ public class Session {
     }
 
     public void tick(final LocalPlayer player) {
-        final ApplicableRegionSet set = regionsAt(player.getLocation());
+        if (!ticks) {
+            return;
+        }
+        uwgTick(player, regionsAt(player.getLocation()));
+    }
+
+    /**
+     * Internal: the same tick with the region set the caller already resolved. Callers check
+     * {@link #uwgTicks()} first, so a session with nothing to tick costs no lookup.
+     */
+    public void uwgTick(final LocalPlayer player, final ApplicableRegionSet set) {
         for (final Handler handler : dispatch) {
             try {
                 handler.tick(player, set);
@@ -212,11 +266,19 @@ public class Session {
             com.tricrotism.uworldguard.wgcompat.CompatDiagnostics.SESSION_DISPATCHES.increment();
             return null;
         }
-        final Set<ProtectedRegion> toRegions = setOf(toSet);
-        final Set<ProtectedRegion> fromRegions = setOf(fromSet);
-        if (!fromRegions.equals(toRegions)) {
-            final Set<ProtectedRegion> entered = difference(toRegions, fromRegions);
-            final Set<ProtectedRegion> exited = difference(fromRegions, toRegions);
+        final Set<ProtectedRegion> entered;
+        final Set<ProtectedRegion> exited;
+        if (fromSet instanceof com.tricrotism.uworldguard.wgcompat.WrappedRegionSet wrappedFrom
+            && toSet instanceof com.tricrotism.uworldguard.wgcompat.WrappedRegionSet wrappedTo) {
+            entered = onlyIn(wrappedTo, wrappedFrom);
+            exited = onlyIn(wrappedFrom, wrappedTo);
+        } else {
+            final Set<ProtectedRegion> toRegions = setOf(toSet);
+            final Set<ProtectedRegion> fromRegions = setOf(fromSet);
+            entered = difference(toRegions, fromRegions);
+            exited = difference(fromRegions, toRegions);
+        }
+        if (!entered.isEmpty() || !exited.isEmpty()) {
             for (final Handler handler : current) {
                 final boolean allowed;
                 try {
@@ -268,8 +330,20 @@ public class Session {
             || !(b instanceof com.tricrotism.uworldguard.wgcompat.WrappedRegionSet wrappedB)) {
             return false;
         }
-        final com.tricrotism.uworldguard.region.ApplicableRegionSet engineA = wrappedA.uwgBacking();
-        final com.tricrotism.uworldguard.region.ApplicableRegionSet engineB = wrappedB.uwgBacking();
+        return uwgSameRegions(wrappedA.uwgBacking(), wrappedB.uwgBacking());
+    }
+
+    /**
+     * Internal: {@link #sameRegions} on the engine sets themselves. Two points in one claim usually
+     * share one set object, which answers before any region is compared.
+     */
+    public static boolean uwgSameRegions(
+        final com.tricrotism.uworldguard.region.ApplicableRegionSet engineA,
+        final com.tricrotism.uworldguard.region.ApplicableRegionSet engineB
+    ) {
+        if (engineA == engineB) {
+            return true;
+        }
         final int n = engineA.size();
         if (n != engineB.size()) {
             return false;
@@ -285,6 +359,33 @@ public class Session {
             return false;
         }
         return true;
+    }
+
+    /**
+     * The regions of {@code a} that {@code b} does not hold, as a fresh set since it goes to consumer
+     * handlers. A handful of regions at most, so the nested walk beats hashing.
+     */
+    private static Set<ProtectedRegion> onlyIn(
+        final com.tricrotism.uworldguard.wgcompat.WrappedRegionSet a,
+        final com.tricrotism.uworldguard.wgcompat.WrappedRegionSet b
+    ) {
+        final com.tricrotism.uworldguard.region.ApplicableRegionSet engineA = a.uwgBacking();
+        final com.tricrotism.uworldguard.region.ApplicableRegionSet engineB = b.uwgBacking();
+        Set<ProtectedRegion> out = null;
+        outer:
+        for (int i = 0, n = engineA.size(); i < n; i++) {
+            final com.tricrotism.uworldguard.region.ProtectedRegion region = engineA.get(i);
+            for (int j = 0, m = engineB.size(); j < m; j++) {
+                if (engineB.get(j) == region) {
+                    continue outer;
+                }
+            }
+            if (out == null) {
+                out = new HashSet<>(4);
+            }
+            out.add(a.uwgWrap(i));
+        }
+        return out != null ? out : new HashSet<>(0);
     }
 
     private static Set<ProtectedRegion> setOf(final ApplicableRegionSet set) {

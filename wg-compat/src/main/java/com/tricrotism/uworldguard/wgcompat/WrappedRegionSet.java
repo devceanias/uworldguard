@@ -31,8 +31,28 @@ public final class WrappedRegionSet implements ApplicableRegionSet {
     private final com.tricrotism.uworldguard.region.ApplicableRegionSet backing;
     private final com.tricrotism.uworldguard.region.RegionManager manager;
 
-    private List<ProtectedRegion> regionList;
-    private Set<ProtectedRegion> regionSet;
+    /**
+     * Built on first use and never written into, so a view shared by every query in one claim can be
+     * read from any thread. Both are unmodifiable for the same reason.
+     */
+    private volatile List<ProtectedRegion> regionList;
+    private volatile Set<ProtectedRegion> regionSet;
+
+    /**
+     * The view of {@code backing}, made once per engine set. A shared set answers every query in its
+     * claim, so consumer plugins querying per event do not allocate a view each time.
+     */
+    public static WrappedRegionSet of(
+        final com.tricrotism.uworldguard.region.ApplicableRegionSet backing,
+        final com.tricrotism.uworldguard.region.RegionManager manager
+    ) {
+        if (backing.uwgCompatView() instanceof WrappedRegionSet view && view.manager == manager) {
+            return view;
+        }
+        final WrappedRegionSet view = new WrappedRegionSet(backing, manager);
+        backing.uwgCompatView(view);
+        return view;
+    }
 
     public WrappedRegionSet(
         final com.tricrotism.uworldguard.region.ApplicableRegionSet backing,
@@ -47,6 +67,13 @@ public final class WrappedRegionSet implements ApplicableRegionSet {
      */
     public com.tricrotism.uworldguard.region.ApplicableRegionSet uwgBacking() {
         return backing;
+    }
+
+    /**
+     * Internal: the API view of the engine region at {@code index}, without building the whole list.
+     */
+    public ProtectedRegion uwgWrap(final int index) {
+        return RegionAdapters.region(backing.get(index), manager);
     }
 
     @Override
@@ -64,7 +91,7 @@ public final class WrappedRegionSet implements ApplicableRegionSet {
         Set<ProtectedRegion> cached = regionSet;
         if (cached == null) {
             final List<ProtectedRegion> regions = regionList();
-            cached = new LinkedHashSet<>(regions);
+            cached = Collections.unmodifiableSet(new LinkedHashSet<>(regions));
             regionSet = cached;
         }
         return cached;
@@ -280,7 +307,7 @@ public final class WrappedRegionSet implements ApplicableRegionSet {
             for (int i = 0; i < n; i++) {
                 regions.add(RegionAdapters.region(backing.get(i), manager));
             }
-            cached = regions;
+            cached = Collections.unmodifiableList(regions);
             regionList = cached;
         }
         return cached;

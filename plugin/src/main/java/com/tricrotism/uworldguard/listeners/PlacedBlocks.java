@@ -100,12 +100,16 @@ public final class PlacedBlocks implements Listener {
             return;
         }
         if (event instanceof BlockMultiPlaceEvent multi) {
+            final Map<Long, Block> touched = new HashMap<>();
             for (final BlockState replaced : multi.getReplacedBlockStates()) {
                 final Block block = replaced.getBlock();
-                record(block, block.getType(), true);
+                record(block, block.getType(), true, touched);
+            }
+            for (final Block inChunk : touched.values()) {
+                persist(inChunk, read(inChunk));
             }
         } else {
-            record(event.getBlock(), event.getBlock().getType(), true);
+            record(event.getBlock(), event.getBlock().getType(), true, null);
         }
     }
 
@@ -124,7 +128,7 @@ public final class PlacedBlocks implements Listener {
             return;
         }
         event.setCancelled(true);
-        messages.sendDeny(player, FLAG, set.queryValue(Flags.DENY_MESSAGE));
+        messages.sendRegionDeny(player, FLAG, set);
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
@@ -155,7 +159,7 @@ public final class PlacedBlocks implements Listener {
             return;
         }
         event.setCancelled(true);
-        messages.sendDeny(player, FLAG, set.queryValue(Flags.DENY_MESSAGE));
+        messages.sendRegionDeny(player, FLAG, set);
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
@@ -185,7 +189,7 @@ public final class PlacedBlocks implements Listener {
             || (data instanceof Levelled levelled && block.getType() == fluid && levelled.getLevel() == 0)) {
             return;
         }
-        record(block, fluid, true);
+        record(block, fluid, true, null);
     }
 
     /**
@@ -277,14 +281,14 @@ public final class PlacedBlocks implements Listener {
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onEntityExploded(final EntityExplodeEvent event) {
         if (!event.blockList().isEmpty() && query.usesFlag(event.getEntity().getWorld(), FLAG)) {
-            forgetAll(event.blockList());
+            forgetAll(event.blockList(), null);
         }
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onBlockExploded(final BlockExplodeEvent event) {
         if (!event.blockList().isEmpty() && query.usesFlag(event.getBlock().getWorld(), FLAG)) {
-            forgetAll(event.blockList());
+            forgetAll(event.blockList(), null);
         }
     }
 
@@ -345,7 +349,7 @@ public final class PlacedBlocks implements Listener {
     /**
      * Moves the record of every placed block a piston pushes or pulls to where it lands. The event
      * fires before the move, so each block still shows its own type. Blocks the piston destroys are
-     * only forgotten.
+     * only forgotten. Each chunk's persistent data is written once, after every record has moved.
      */
     private void carry(final Block piston, final List<Block> moved, final boolean extending) {
         if (moved.isEmpty() || !query.usesFlag(piston.getWorld(), FLAG)
@@ -367,12 +371,16 @@ public final class PlacedBlocks implements Listener {
         }
         final BlockFace facing = directional.getFacing();
         final BlockFace direction = extending ? facing : facing.getOppositeFace();
+        final Map<Long, Block> touched = new HashMap<>();
         // Every source is forgotten first, so a block landing on the next one's old spot keeps its record.
-        forgetAll(carried);
+        forgetAll(carried, touched);
         for (final Block block : carried) {
             if (block.getPistonMoveReaction() != PistonMoveReaction.BREAK) {
-                record(block.getRelative(direction), block.getType(), false);
+                record(block.getRelative(direction), block.getType(), false, touched);
             }
+        }
+        for (final Block inChunk : touched.values()) {
+            persist(inChunk, read(inChunk));
         }
     }
 
@@ -385,11 +393,14 @@ public final class PlacedBlocks implements Listener {
      * average. A piston carrying several blocks passes {@code false}: its destinations do not hold the
      * moved blocks yet and would read as stale.
      */
-    private void record(final Block block, final Material type, final boolean prune) {
+    private void record(
+        final Block block, final Material type, final boolean prune, final @Nullable Map<Long, Block> deferred
+    ) {
         if (query.getApplicableRegions(block).queryValue(FLAG) == null) {
             return;
         }
-        long[] current = read(block);
+        final long[] known = read(block);
+        long[] current = known;
         if (prune && current.length >= 64 && Integer.bitCount(current.length) == 1) {
             current = withoutStale(block, current);
         }
@@ -398,6 +409,9 @@ public final class PlacedBlocks implements Listener {
         final int at = find(current, position);
         final long[] next;
         if (at >= 0) {
+            if (current[at] == entry && current == known) {
+                return;
+            }
             current[at] = entry;
             next = current;
         } else {
@@ -407,17 +421,17 @@ public final class PlacedBlocks implements Listener {
             next[insert] = entry;
             System.arraycopy(current, insert, next, insert + 1, current.length - insert);
         }
-        write(block, next);
+        write(block, next, deferred);
     }
 
     private void forget(final Block block) {
-        forgetIn(block, List.of(block));
+        forgetIn(block, List.of(block), null);
     }
 
     /**
      * Groups by chunk so each chunk's record is read and written once, not once per block.
      */
-    private void forgetAll(final List<Block> blocks) {
+    private void forgetAll(final List<Block> blocks, final @Nullable Map<Long, Block> deferred) {
         final Map<Long, List<Block>> byChunk = new HashMap<>();
         for (int i = 0, n = blocks.size(); i < n; i++) {
             final Block block = blocks.get(i);
@@ -425,14 +439,14 @@ public final class PlacedBlocks implements Listener {
                 .add(block);
         }
         for (final List<Block> inChunk : byChunk.values()) {
-            forgetIn(inChunk.getFirst(), inChunk);
+            forgetIn(inChunk.getFirst(), inChunk, deferred);
         }
     }
 
     /**
      * Removes the entries of {@code blocks}, which all lie in the chunk of {@code inChunk}.
      */
-    private void forgetIn(final Block inChunk, final List<Block> blocks) {
+    private void forgetIn(final Block inChunk, final List<Block> blocks, final @Nullable Map<Long, Block> deferred) {
         final long[] entries = read(inChunk);
         if (entries.length == 0) {
             return;
@@ -450,7 +464,7 @@ public final class PlacedBlocks implements Listener {
             return;
         }
         if (removed == entries.length) {
-            write(inChunk, NONE);
+            write(inChunk, NONE, deferred);
             return;
         }
         final long[] next = new long[entries.length - removed];
@@ -460,7 +474,7 @@ public final class PlacedBlocks implements Listener {
                 next[j++] = entries[i];
             }
         }
-        write(inChunk, next);
+        write(inChunk, next, deferred);
     }
 
     /**
@@ -494,10 +508,22 @@ public final class PlacedBlocks implements Listener {
     /**
      * Writes through: the memory copy and the chunk's persistent data change together, so nothing is
      * owed to the disk when the chunk unloads or the server stops.
+     *
+     * <p>A handler that writes the same chunk several times passes {@code deferred} instead. Only the
+     * memory copy changes, the chunk is noted there, and the handler persists each noted chunk once
+     * before it returns.
      */
-    private void write(final Block block, final long[] entries) {
-        cached.computeIfAbsent(block.getWorld().getUID(), NEW_WORLD)
-            .put(Chunk.getChunkKey(block.getX() >> 4, block.getZ() >> 4), entries);
+    private void write(final Block block, final long[] entries, final @Nullable Map<Long, Block> deferred) {
+        final Long chunk = Chunk.getChunkKey(block.getX() >> 4, block.getZ() >> 4);
+        cached.computeIfAbsent(block.getWorld().getUID(), NEW_WORLD).put(chunk, entries);
+        if (deferred == null) {
+            persist(block, entries);
+        } else {
+            deferred.putIfAbsent(chunk, block);
+        }
+    }
+
+    private void persist(final Block block, final long[] entries) {
         final PersistentDataContainer data = block.getChunk().getPersistentDataContainer();
         if (entries.length == 0) {
             data.remove(key);

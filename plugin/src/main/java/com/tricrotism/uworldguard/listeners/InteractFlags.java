@@ -98,13 +98,19 @@ import java.util.UUID;
     }
 
     /**
-     * Whether a flag narrower than {@code interact}/{@code use} explicitly allows this block.
+     * Whether a flag narrower than {@code interact}/{@code use} explicitly allows this block, either
+     * by listing it in {@code allow-interact} or by setting the block's own flag to allow. {@code type}
+     * is the block's type, which the caller has already read.
      *
      * <p>Only called once the broad check has already decided to deny, so the common case of an
      * allowed interaction never reaches the block-state read that identifies a container.
      */
-    static boolean explicitlyAllowed(final ApplicableRegionSet set, final UUID uuid, final Block block) {
-        final Material type = block.getType();
+    static boolean explicitlyAllowed(
+        final ApplicableRegionSet set, final UUID uuid, final Block block, final Material type
+    ) {
+        if (set.flagSetContains(Flags.ALLOW_INTERACT, type)) {
+            return true;
+        }
         if (type == Material.RESPAWN_ANCHOR) {
             return set.queryExplicitState(Flags.RESPAWN_ANCHORS, uuid) == State.ALLOW;
         }

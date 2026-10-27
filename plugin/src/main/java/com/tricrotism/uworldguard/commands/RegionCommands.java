@@ -10,6 +10,7 @@ import com.tricrotism.uworldguard.gui.*;
 import com.tricrotism.uworldguard.region.*;
 import com.tricrotism.uworldguard.selection.Selection;
 import com.tricrotism.uworldguard.selection.SelectionService;
+import com.tricrotism.uworldguard.text.DenyDebug;
 import com.tricrotism.uworldguard.text.MessageService;
 import com.tricrotism.uworldguard.text.Messages;
 import com.tricrotism.uworldguard.util.BlockVector3;
@@ -111,8 +112,10 @@ public final class RegionCommands {
         Map.entry("menu", "menus"),
         Map.entry("settings", "menus"),
         Map.entry("bypass", "admin"),
+        Map.entry("debug", "admin"),
         Map.entry("reload", "admin"),
         Map.entry("migrate", "admin"),
+        Map.entry("blacklist", "admin"),
         Map.entry("compat", "admin"));
 
     /**
@@ -678,6 +681,21 @@ public final class RegionCommands {
         }
     }
 
+    @Command("uworldguard|uwg|worldguard|wg|region|regions|rg debug")
+    @CommandDescription("Toggle explanations of which flag refused you and which region set it")
+    @Permission(DenyDebug.NODE)
+    public void debug(final Source sender) {
+        final Player player = asPlayer(sender);
+        if (player == null) return;
+
+        if (DenyDebug.toggle(player)) {
+            success(sender, "Debug <green>on</green>. Each time a region refuses you something, you are told "
+                + "which flag did it and which region set it. It turns itself off when you log out.");
+        } else {
+            note(sender, "Debug <red>off</red>.");
+        }
+    }
+
     /**
      * Loads a region's bounds back into the player's selection, the step that makes {@code redefine}
      * usable for a small correction: overshooting a region by a block otherwise means placing both
@@ -861,7 +879,7 @@ public final class RegionCommands {
         }
 
         final TagResolver flagTag = Placeholder.unparsed("flag", flag.getName());
-        if (value == null) {
+        if (value == null || value.isBlank()) {
             if (group != null) {
                 switch (editor.setFlagGroup(region, flag, group, sender.source())) {
                     case APPLIED, UNCHANGED -> success(sender,
@@ -1470,7 +1488,6 @@ public final class RegionCommands {
     private static final List<String> MATERIAL_NAMES = materialNames();
     private static final List<String> ENTITY_NAMES = entityNames();
 
-    @SuppressWarnings("deprecation")
     private static List<String> materialNames() {
         final List<String> names = new ArrayList<>();
         for (final org.bukkit.Material material : org.bukkit.Material.values()) {

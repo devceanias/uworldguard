@@ -2,6 +2,8 @@ package com.tricrotism.uworldguard.text;
 
 import com.tricrotism.uworldguard.config.ConfigUpdater;
 import com.tricrotism.uworldguard.flags.Flag;
+import com.tricrotism.uworldguard.flags.Flags;
+import com.tricrotism.uworldguard.region.ApplicableRegionSet;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.minimessage.MiniMessage;
 import net.kyori.adventure.text.minimessage.tag.resolver.TagResolver;
@@ -109,13 +111,23 @@ public final class MessageService {
         return cooldownMillis / 1000L;
     }
 
+    /**
+     * An unchanged value skips the save, which would otherwise revert any hand edit made to the file
+     * since the last reload.
+     */
     public void setCooldownSeconds(final long seconds) {
-        this.cooldownMillis = Math.max(0L, seconds) * 1000L;
+        final long millis = Math.max(0L, seconds) * 1000L;
+        if (millis == cooldownMillis) {
+            return;
+        }
+        this.cooldownMillis = millis;
         save();
     }
 
     public void setMessage(final String key, final String value) {
-        templates.put(key, value);
+        if (value.equals(templates.put(key, value))) {
+            return;
+        }
         if (key.startsWith(DENY_PREFIX)) {
             this.denyOverrides = true;
         }
@@ -224,6 +236,9 @@ public final class MessageService {
      * <p>Every flag gets its own cooldown, whichever entry supplies the text.
      */
     public void sendDeny(final Player player, final Flag<?> flag) {
+        if (!coolingDown(player.getUniqueId(), denyKey(flag))) {
+            DenyDebug.explain(player, flag, null);
+        }
         sendDeny(player, flag, null);
     }
 
@@ -236,7 +251,7 @@ public final class MessageService {
      * means there is no default text, so the region's own message still shows.
      */
     public void sendDeny(final Player player, final Flag<?> flag, final @Nullable String regionMessage) {
-        final String cooldownKey = denyKeys.computeIfAbsent(flag, DENY_KEY_FOR);
+        final String cooldownKey = denyKey(flag);
         final String override = denyOverrides ? templates.get(cooldownKey) : null;
         final String configured = override != null ? override : templates.get(DENY_KEY);
 
@@ -247,6 +262,35 @@ public final class MessageService {
             return;
         }
         dispatch(player, cooldownKey, configured, NO_RESOLVERS);
+    }
+
+    /**
+     * Same, reading the region's {@code deny-message} from {@code set} only when a message can go out.
+     * A held click is refused every tick and the cooldown drops all but one of those.
+     */
+    public void sendRegionDeny(final Player player, final Flag<?> flag, final ApplicableRegionSet set) {
+        if (!coolingDown(player.getUniqueId(), denyKey(flag))) {
+            DenyDebug.explain(player, flag, set);
+            sendDeny(player, flag, set.queryValue(Flags.DENY_MESSAGE));
+        }
+    }
+
+    /**
+     * A plain read first, since {@code computeIfAbsent} costs more than a lookup even when the key
+     * exists, and a held click hits this every tick.
+     */
+    private String denyKey(final Flag<?> flag) {
+        final String key = denyKeys.get(flag);
+        return key != null ? key : denyKeys.computeIfAbsent(flag, DENY_KEY_FOR);
+    }
+
+    private boolean coolingDown(final UUID uuid, final String key) {
+        if (cooldownMillis <= 0L) {
+            return false;
+        }
+        final Map<String, AtomicLong> perPlayer = lastSent.get(uuid);
+        final AtomicLong slot = perPlayer == null ? null : perPlayer.get(key);
+        return slot != null && System.currentTimeMillis() - slot.get() < cooldownMillis;
     }
 
     private static boolean silenced(final @Nullable String template) {
@@ -265,6 +309,7 @@ public final class MessageService {
             case "block-place", "deny-block-place" -> "place that block";
             case "interact", "use" -> "use that";
             case "chest-access" -> "open that";
+            case "wind-charge" -> "throw that";
             default -> flag.getName();
         };
     }

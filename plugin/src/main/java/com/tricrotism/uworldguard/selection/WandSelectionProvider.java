@@ -51,12 +51,16 @@ public final class WandSelectionProvider implements SelectionProvider, Listener 
             return;
         }
         if (event.getAction() == Action.LEFT_CLICK_BLOCK) {
-            first.put(player.getUniqueId(), block.getLocation());
-            send(player, "first", block);
+            final Location corner = block.getLocation();
+            if (!corner.equals(first.put(player.getUniqueId(), corner))) {
+                send(player, "first", block);
+            }
             event.setCancelled(true);
         } else if (event.getAction() == Action.RIGHT_CLICK_BLOCK) {
-            second.put(player.getUniqueId(), block.getLocation());
-            send(player, "second", block);
+            final Location corner = block.getLocation();
+            if (!corner.equals(second.put(player.getUniqueId(), corner))) {
+                send(player, "second", block);
+            }
             event.setCancelled(true);
         }
     }

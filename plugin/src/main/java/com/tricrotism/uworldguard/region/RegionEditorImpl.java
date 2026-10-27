@@ -109,9 +109,13 @@ public final class RegionEditorImpl implements RegionEditor {
             world, region, flag, current, value, currentGroup, nextGroup, actor))) {
             return EditResult.CANCELLED;
         }
-        region.setFlag(flag, value);
-        region.setFlagGroup(flag, nextGroup);
-        manager.markDirty();
+        // Note: we wanna read this again, since a listener may have edited the region during the event
+        if (!Objects.equals(region.getFlags().get(flag), value)) {
+            region.setFlag(flag, value);
+        }
+        if (directGroup(region, flag) != nextGroup) {
+            region.setFlagGroup(flag, nextGroup);
+        }
         return EditResult.APPLIED;
     }
 
@@ -135,7 +139,6 @@ public final class RegionEditorImpl implements RegionEditor {
             return EditResult.CANCELLED;
         }
         region.setFlagGroup(flag, group);
-        manager.markDirty();
         return EditResult.APPLIED;
     }
 
@@ -168,7 +171,6 @@ public final class RegionEditorImpl implements RegionEditor {
         for (final RegionPriorityChangeEvent change : changes) {
             change.getRegion().setPriority(change.getNewPriority());
         }
-        manager.markDirty();
         return EditResult.APPLIED;
     }
 
@@ -194,7 +196,6 @@ public final class RegionEditorImpl implements RegionEditor {
         } catch (final IllegalArgumentException _) {
             return EditResult.INVALID;
         }
-        manager.markDirty();
         return EditResult.APPLIED;
     }
 
@@ -235,7 +236,7 @@ public final class RegionEditorImpl implements RegionEditor {
         } else {
             domain.removePlayer(player);
         }
-        manager.markDirty();
+        manager.uwgMarkUnsaved();
         return EditResult.APPLIED;
     }
 
@@ -264,7 +265,7 @@ public final class RegionEditorImpl implements RegionEditor {
         } else {
             domain.removeGroup(group);
         }
-        manager.markDirty();
+        manager.uwgMarkUnsaved();
         return EditResult.APPLIED;
     }
 

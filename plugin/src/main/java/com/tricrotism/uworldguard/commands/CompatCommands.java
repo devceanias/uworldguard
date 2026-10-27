@@ -13,7 +13,6 @@ import org.incendo.cloud.paper.util.sender.Source;
 import org.jspecify.annotations.NullMarked;
 
 import java.util.Map;
-import java.util.concurrent.atomic.LongAdder;
 
 @NullMarked
 public final class CompatCommands {
@@ -39,14 +38,14 @@ public final class CompatCommands {
             Placeholder.unparsed("version",
                 worldEdit == null ? "not installed" : worldEdit.getPluginMeta().getVersion())));
 
-        line(sender, "Region queries", CompatDiagnostics.QUERIES);
-        line(sender, "Region reads", CompatDiagnostics.REGION_READS);
-        line(sender, "Region mutations", CompatDiagnostics.REGION_MUTATIONS);
-        line(sender, "Player wraps", CompatDiagnostics.WRAPS);
-        line(sender, "Custom flags registered", CompatDiagnostics.FLAG_REGISTRATIONS);
-        line(sender, "Session dispatches", CompatDiagnostics.SESSION_DISPATCHES);
-        line(sender, "Events fired", CompatDiagnostics.EVENTS_FIRED);
-        line(sender, "Flag values rejected", CompatDiagnostics.FLAG_PARSE_FAILURES);
+        line(sender, "Region queries", CompatDiagnostics.QUERIES.sum());
+        line(sender, "Region reads", CompatDiagnostics.REGION_READS.sum());
+        line(sender, "Region mutations", CompatDiagnostics.REGION_MUTATIONS.sum());
+        line(sender, "Player wraps", CompatDiagnostics.WRAPS.sum());
+        line(sender, "Custom flags registered", CompatDiagnostics.FLAG_REGISTRATIONS.sum());
+        line(sender, "Session dispatches", CompatDiagnostics.SESSION_DISPATCHES.sum());
+        line(sender, "Events fired", CompatDiagnostics.EVENTS_FIRED.sum());
+        line(sender, "Flag values rejected", CompatDiagnostics.FLAG_PARSE_FAILURES.sum());
 
         final Map<String, String> parseErrors = CompatDiagnostics.flagParseErrors();
         if (!parseErrors.isEmpty()) {
@@ -73,9 +72,9 @@ public final class CompatCommands {
         }
     }
 
-    private static void line(final Source sender, final String label, final LongAdder counter) {
+    private static void line(final Source sender, final String label, final long count) {
         sender.source().sendMessage(Messages.format("<gray><label>: <white><count>",
             Placeholder.unparsed("label", label),
-            Placeholder.unparsed("count", Long.toString(counter.sum()))));
+            Placeholder.unparsed("count", Long.toString(count))));
     }
 }

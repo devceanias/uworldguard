@@ -60,6 +60,7 @@ class BreakPlacedOnlyTest {
     private BuildProtectionListener build;
     private PlacedBlocks placed;
     private PlayerMock player;
+    private RegionQuery query;
 
     @BeforeEach
     void setUp() throws Exception {
@@ -81,7 +82,7 @@ class BreakPlacedOnlyTest {
         arena.setFlag(Flags.BREAK_PLACED_ONLY, State.ALLOW);
         manager.addRegion(arena);
 
-        final RegionQuery query = container.createQuery();
+        query = container.createQuery();
         final MessageService messages = new MessageService(plugin);
         build = new BuildProtectionListener(query, messages);
         placed = new PlacedBlocks(plugin, query, messages);
@@ -175,6 +176,23 @@ class BreakPlacedOnlyTest {
         placed.onEntityExplode(event);
 
         assertEquals(List.of(built), event.blockList());
+    }
+
+    @Test
+    void anExplosionAcrossARegionEdgeIsJudgedPerBlock() {
+        final ProtectedCuboidRegion keep = new ProtectedCuboidRegion("keep", BlockVector3.at(40, 0, 0),
+            BlockVector3.at(41, 255, 32));
+        keep.setFlag(Flags.TNT, State.DENY);
+        manager.addRegion(keep);
+        final List<Block> blocks = new ArrayList<>();
+        for (int x = 38; x <= 43; x++) {
+            blocks.add(world.getBlockAt(x, 64, 5));
+        }
+
+        query.removeDenied(world, blocks, Flags.TNT);
+
+        assertEquals(List.of(38, 39, 42, 43), blocks.stream().map(Block::getX).toList(),
+            "the run inside the denying region is spared and the answer flips back after it");
     }
 
     @Test

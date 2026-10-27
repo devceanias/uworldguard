@@ -51,11 +51,17 @@ public class GroupDomain implements Domain, ChangeTracked {
     }
 
     public void addGroup(final String name) {
+        if (backing.containsGroup(name)) {
+            return;
+        }
         backing.addGroup(name);
         changed();
     }
 
     public void removeGroup(final String name) {
+        if (!backing.containsGroup(name)) {
+            return;
+        }
         backing.removeGroup(name);
         changed();
     }
@@ -103,7 +109,11 @@ public class GroupDomain implements Domain, ChangeTracked {
 
     @Override
     public void clear() {
-        for (final String group : backing.getGroups()) {
+        final Set<String> groups = backing.getGroups();
+        if (groups.isEmpty()) {
+            return;
+        }
+        for (final String group : groups) {
             backing.removeGroup(group);
         }
         changed();

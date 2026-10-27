@@ -30,7 +30,7 @@ public final class UwgPlatform extends com.sk89q.worldguard.bukkit.BukkitWorldGu
 
     @Override
     public String getPlatformVersion() {
-        return WgCompatBridge.plugin().getPluginMeta().getVersion();
+        return WgCompatBridge.plugin().getDescription().getVersion();
     }
 
     @Override

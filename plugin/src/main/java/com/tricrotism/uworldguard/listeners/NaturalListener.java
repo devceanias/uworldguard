@@ -43,6 +43,14 @@ public final class NaturalListener implements Listener {
 
     private static final Set<Material> CORALS = fadeable("CORAL");
     private static final Set<Material> COPPERS = fadeable("COPPER");
+    /**
+     * The flags each handler below picks from a block's type, so the type is read only where one is set.
+     */
+    private static final long[] FLOW_FLAGS = Flags.mask(Flags.LAVA_FLOW, Flags.WATER_FLOW);
+    private static final long[] SPREAD_FLAGS = Flags.mask(Flags.FIRE_SPREAD, Flags.GRASS_GROWTH,
+        Flags.MYCELIUM_SPREAD, Flags.SCULK_GROWTH, Flags.MUSHROOM_GROWTH);
+    private static final long[] FADE_FLAGS = Flags.mask(Flags.ICE_MELT, Flags.FROSTED_ICE_MELT, Flags.SNOW_MELT,
+        Flags.CORAL_FADE, Flags.COPPER_FADE);
 
     private final RegionQuery query;
 
@@ -66,6 +74,9 @@ public final class NaturalListener implements Listener {
             return;
         }
         final Block from = event.getBlock();
+        if (!query.usesAnyFlag(from.getWorld(), FLOW_FLAGS)) {
+            return;
+        }
         final StateFlag flag = switch (from.getType()) {
             case LAVA -> Flags.LAVA_FLOW;
             case WATER -> Flags.WATER_FLOW;
@@ -110,6 +121,10 @@ public final class NaturalListener implements Listener {
         if (EventGate.disabled(event)) {
             return;
         }
+        final Block block = event.getBlock();
+        if (!query.usesAnyFlag(block.getWorld(), SPREAD_FLAGS)) {
+            return;
+        }
         final StateFlag flag = switch (event.getSource().getType()) {
             case FIRE -> Flags.FIRE_SPREAD;
             case GRASS_BLOCK -> Flags.GRASS_GROWTH;
@@ -118,7 +133,6 @@ public final class NaturalListener implements Listener {
             case RED_MUSHROOM, BROWN_MUSHROOM -> Flags.MUSHROOM_GROWTH;
             default -> null;
         };
-        final Block block = event.getBlock();
         if (flag == null || !query.usesFlag(block.getWorld(), flag)) {
             return;
         }
@@ -173,6 +187,9 @@ public final class NaturalListener implements Listener {
             return;
         }
         final Block block = event.getBlock();
+        if (!query.usesAnyFlag(block.getWorld(), FADE_FLAGS)) {
+            return;
+        }
         final Material type = block.getType();
         StateFlag flag = switch (type) {
             case ICE -> Flags.ICE_MELT;
@@ -263,19 +280,18 @@ public final class NaturalListener implements Listener {
     }
 
     /**
-     * Explosions with no entity behind them — a bed or respawn anchor detonating in the wrong
-     * dimension. {@code EntityExplodeEvent} never fires for these, so they were ungated entirely.
+     * Explosions with no entity behind them, such as a bed or respawn anchor detonating in the wrong
+     * dimension. {@code EntityExplodeEvent} never fires for these. The blast acts as a member of the
+     * claim the block is in, so it breaks blocks there and not across the border, as in WorldGuard.
      */
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     public void onBlockExplode(final BlockExplodeEvent event) {
-        if (EventGate.disabled(event)) {
+        if (EventGate.disabled(event) || event.blockList().isEmpty()) {
             return;
         }
-        if (event.blockList().isEmpty()
-            || !query.usesFlag(event.getBlock().getWorld(), Flags.OTHER_EXPLOSION)) {
-            return;
-        }
-        query.removeDenied(event.getBlock().getWorld(), event.blockList(), Flags.OTHER_EXPLOSION);
+        final Block block = event.getBlock();
+        query.removeUnbreakable(block.getWorld(), event.blockList(), Flags.OTHER_EXPLOSION, false,
+            null, query.getApplicableRegions(block));
     }
 
     /**

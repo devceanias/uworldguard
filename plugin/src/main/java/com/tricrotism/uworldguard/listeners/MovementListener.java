@@ -15,6 +15,7 @@ import com.tricrotism.uworldguard.service.ChamberedPearlTracker;
 import com.tricrotism.uworldguard.service.CollisionService;
 import com.tricrotism.uworldguard.service.PendingRestores;
 import com.tricrotism.uworldguard.text.ChatTags;
+import com.tricrotism.uworldguard.text.DenyDebug;
 import com.tricrotism.uworldguard.text.MessageService;
 import com.tricrotism.uworldguard.util.Locations;
 import com.tricrotism.uworldguard.wgcompat.SessionDispatch;
@@ -28,6 +29,7 @@ import org.bukkit.GameMode;
 import org.bukkit.Location;
 import org.bukkit.World;
 import org.bukkit.entity.Entity;
+import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Player;
 import org.bukkit.event.*;
 import org.bukkit.event.entity.EntityDismountEvent;
@@ -52,6 +54,12 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class MovementListener implements Listener {
 
     private static final String NOTIFY_PERMISSION = "uworldguard.notify";
+    /**
+     * Every flag {@link #applyState} reads.
+     */
+    private static final long[] STATE_FLAGS = Flags.mask(Flags.GAME_MODE, Flags.WALK_SPEED, Flags.FLY_SPEED,
+        Flags.FLY, Flags.DISABLE_COLLISION, Flags.CHAT_PREFIX, Flags.CHAT_SUFFIX, Flags.SEND_CHAT,
+        Flags.RECEIVE_CHAT, Flags.HIDE_PLAYERS);
 
     private final Plugin plugin;
     private final RegionQuery query;
@@ -70,6 +78,11 @@ public final class MovementListener implements Listener {
     private final Map<UUID, Float> savedFlySpeed = new ConcurrentHashMap<>();
     private final Map<UUID, Boolean> savedAllowFlight = new ConcurrentHashMap<>();
     private final Set<UUID> riddenMounts = ConcurrentHashMap.newKeySet();
+    /**
+     * The non-player living entries of {@code riddenMounts}. Only non-player living entities fire
+     * {@link EntityMoveEvent}, so this set alone decides whether {@link MountMoves} is registered.
+     */
+    private final Set<UUID> riddenLivingMounts = ConcurrentHashMap.newKeySet();
     private final MountMoves mountMoves = new MountMoves();
     private volatile boolean mountMovesRegistered;
     private final Set<UUID> hidden = ConcurrentHashMap.newKeySet();
@@ -316,9 +329,14 @@ public final class MovementListener implements Listener {
      * Re-reads the movement settings and restarts the poll to match, so {@code /uwg reload} can switch
      * between EVENT and TASK or retune the interval without a restart. Positions tracked for the old
      * mode are dropped: in EVENT mode they go stale immediately, and on the way back into TASK mode a
-     * stale position would be judged as a crossing the player never made.
+     * stale position would be judged as a crossing the player never made. A reload that keeps the
+     * mode and interval leaves the running polls and their positions alone.
      */
     public void applySettings(final Settings settings) {
+        if ((settings.movementMode() == Settings.MovementMode.TASK) == taskMode
+            && settings.movementTaskTicks() == taskTicks) {
+            return;
+        }
         stopPolls();
         readSettings(settings);
         lastPosition.clear();
@@ -349,6 +367,7 @@ public final class MovementListener implements Listener {
         HandlerList.unregisterAll(mountMoves);
         mountMovesRegistered = false;
         riddenMounts.clear();
+        riddenLivingMounts.clear();
     }
 
     /**
@@ -387,7 +406,6 @@ public final class MovementListener implements Listener {
         savedWalkSpeed.clear();
         savedFlySpeed.clear();
         savedAllowFlight.clear();
-        restores.flushNow();
 
         for (final UUID viewerId : hidden) {
             final Player viewer = Bukkit.getPlayer(viewerId);
@@ -523,6 +541,9 @@ public final class MovementListener implements Listener {
         final Player player, final World world, final ApplicableRegionSet fromSet,
         final ApplicableRegionSet toSet
     ) {
+        if (fromSet == toSet) {
+            return false;
+        }
         final boolean entering = !isInside(fromSet, toSet);
         final boolean leaving = !isInside(toSet, fromSet);
         if (!entering && !leaving) {
@@ -551,12 +572,14 @@ public final class MovementListener implements Listener {
         final UUID uuid = player.getUniqueId();
 
         if (entering && !toSet.testState(Flags.ENTRY, uuid) && !isMember(toSet, uuid)) {
+            DenyDebug.explain(player, Flags.ENTRY, toSet);
             messages.sendFlag(player, toSet.queryValue(Flags.ENTRY_DENY_MESSAGE), "entry-denied");
             return true;
         }
 
         if (leaving && !fromSet.testState(Flags.EXIT, uuid) && !isMember(fromSet, uuid)
             && !Boolean.TRUE.equals(fromSet.queryValue(Flags.EXIT_OVERRIDE))) {
+            DenyDebug.explain(player, Flags.EXIT, fromSet);
             messages.sendFlag(player, fromSet.queryValue(Flags.EXIT_DENY_MESSAGE), "exit-denied");
             return true;
         }
@@ -601,7 +624,8 @@ public final class MovementListener implements Listener {
      * cancel here is just a cheap first stop. Per-region effects and continuous state still ride on
      * {@link MovementListener#onMove}.
      *
-     * <p>Its own listener, registered only while somebody is actually riding. The server recomputes
+     * <p>Its own listener, registered only while somebody is riding a living mount. Boats and minecarts
+     * never fire this event, so riding one leaves it unregistered. The server recomputes
      * {@code ServerLevel.hasEntityMoveEvent} from this event's handler list every tick, and while any
      * handler is registered, every non-player living entity whose position <em>or rotation</em>
      * changed that tick builds two {@link Location}s and fires the event — so a mob standing still
@@ -613,11 +637,11 @@ public final class MovementListener implements Listener {
 
         @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
         public void onMountMove(final EntityMoveEvent event) {
-            if (riddenMounts.isEmpty() || !event.hasChangedBlock()) {
+            if (riddenLivingMounts.isEmpty() || !event.hasChangedBlock()) {
                 return;
             }
             final Entity mount = event.getEntity();
-            if (!riddenMounts.contains(mount.getUniqueId())) {
+            if (!riddenLivingMounts.contains(mount.getUniqueId())) {
                 return;
             }
             if (EventGate.disabled(event)) {
@@ -630,7 +654,7 @@ public final class MovementListener implements Listener {
     }
 
     /**
-     * Brings the {@link MountMoves} registration in line with whether anything is being ridden.
+     * Brings the {@link MountMoves} registration in line with whether any living mount is being ridden.
      *
      * <p>The decision is made on the global region thread rather than by the caller: mounts and
      * dismounts arrive on region threads that can interleave, and settling it in one place means a
@@ -639,7 +663,7 @@ public final class MovementListener implements Listener {
      */
     private void syncMountMoves() {
         plugin.getServer().getGlobalRegionScheduler().execute(plugin, () -> {
-            final boolean wanted = !riddenMounts.isEmpty();
+            final boolean wanted = !riddenLivingMounts.isEmpty();
             if (wanted == mountMovesRegistered) {
                 return;
             }
@@ -684,7 +708,9 @@ public final class MovementListener implements Listener {
             return false;
         }
         if (vehicle.isEmpty()) {
-            if (riddenMounts.remove(vehicle.getUniqueId())) {
+            final UUID id = vehicle.getUniqueId();
+            riddenMounts.remove(id);
+            if (riddenLivingMounts.remove(id)) {
                 syncMountMoves();
             }
             return false;
@@ -711,8 +737,10 @@ public final class MovementListener implements Listener {
             }
             final UUID uuid = player.getUniqueId();
             if (entering && !toSet.testState(Flags.ENTRY, uuid) && !isMember(toSet, uuid)) {
+                DenyDebug.explain(player, Flags.ENTRY, toSet);
                 messages.sendFlag(player, toSet.queryValue(Flags.ENTRY_DENY_MESSAGE), "entry-denied");
             } else if (exitGuarded && !fromSet.testState(Flags.EXIT, uuid) && !isMember(fromSet, uuid)) {
+                DenyDebug.explain(player, Flags.EXIT, fromSet);
                 messages.sendFlag(player, fromSet.queryValue(Flags.EXIT_DENY_MESSAGE), "exit-denied");
             } else if (levelled && !isMember(toSet, uuid) && levelDenied(player, toSet)) {
                 messages.send(player, "entry-denied");
@@ -780,12 +808,18 @@ public final class MovementListener implements Listener {
     }
 
     /**
-     * Starts tracking the mount so {@link MountMoves#onMountMove} enforces its movement.
+     * Starts tracking the mount so its movement is enforced, by {@link MountMoves#onMountMove} for a
+     * non-player living mount and by {@link #onVehicleMove} for a boat or minecart.
      */
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onMounted(final EntityMountEvent event) {
-        if (event.getEntity() instanceof Player && !EventGate.disabled(event)
-            && riddenMounts.add(event.getMount().getUniqueId())) {
+        if (!(event.getEntity() instanceof Player) || EventGate.disabled(event)) {
+            return;
+        }
+        final Entity mount = event.getMount();
+        final UUID id = mount.getUniqueId();
+        riddenMounts.add(id);
+        if (mount instanceof LivingEntity && !(mount instanceof Player) && riddenLivingMounts.add(id)) {
             syncMountMoves();
         }
     }
@@ -807,7 +841,9 @@ public final class MovementListener implements Listener {
                 return;
             }
         }
-        if (riddenMounts.remove(mount.getUniqueId())) {
+        final UUID id = mount.getUniqueId();
+        riddenMounts.remove(id);
+        if (riddenLivingMounts.remove(id)) {
             syncMountMoves();
         }
     }
@@ -1108,6 +1144,12 @@ public final class MovementListener implements Listener {
      */
     private void applyState(final Player player, final ApplicableRegionSet toSet) {
         final UUID uuid = player.getUniqueId();
+        if (!toSet.worldUsesAny(STATE_FLAGS) && appliedGameModes.isEmpty() && savedWalkSpeed.isEmpty()
+            && savedFlySpeed.isEmpty() && savedAllowFlight.isEmpty()) {
+            collision.set(player, false);
+            applyHidePlayers(player, uuid, false);
+            return;
+        }
         boolean owedChanged = false;
 
         final GameMode mode = toSet.worldUses(Flags.GAME_MODE) && !Bypass.has(player)
@@ -1132,35 +1174,39 @@ public final class MovementListener implements Listener {
 
         final Double walk = toSet.worldUses(Flags.WALK_SPEED) ? toSet.queryValue(Flags.WALK_SPEED) : null;
         if (walk != null) {
-            if (savedWalkSpeed.get(uuid) == null) {
-                owedChanged |= savedWalkSpeed.putIfAbsent(uuid, player.getWalkSpeed()) == null;
-            }
             final float target = clampSpeed(walk.floatValue());
             if (player.getWalkSpeed() != target) {
+                if (savedWalkSpeed.get(uuid) == null) {
+                    owedChanged |= savedWalkSpeed.putIfAbsent(uuid, player.getWalkSpeed()) == null;
+                }
                 player.setWalkSpeed(target);
             }
         } else if (!savedWalkSpeed.isEmpty()) {
             final Float saved = savedWalkSpeed.remove(uuid);
             if (saved != null) {
                 owedChanged = true;
-                player.setWalkSpeed(saved);
+                if (player.getWalkSpeed() != saved) {
+                    player.setWalkSpeed(saved);
+                }
             }
         }
 
         final Double fly = toSet.worldUses(Flags.FLY_SPEED) ? toSet.queryValue(Flags.FLY_SPEED) : null;
         if (fly != null) {
-            if (savedFlySpeed.get(uuid) == null) {
-                owedChanged |= savedFlySpeed.putIfAbsent(uuid, player.getFlySpeed()) == null;
-            }
             final float target = clampSpeed(fly.floatValue());
             if (player.getFlySpeed() != target) {
+                if (savedFlySpeed.get(uuid) == null) {
+                    owedChanged |= savedFlySpeed.putIfAbsent(uuid, player.getFlySpeed()) == null;
+                }
                 player.setFlySpeed(target);
             }
         } else if (!savedFlySpeed.isEmpty()) {
             final Float saved = savedFlySpeed.remove(uuid);
             if (saved != null) {
                 owedChanged = true;
-                player.setFlySpeed(saved);
+                if (player.getFlySpeed() != saved) {
+                    player.setFlySpeed(saved);
+                }
             }
         }
 
@@ -1339,6 +1385,7 @@ public final class MovementListener implements Listener {
         lastPosition.remove(uuid);
         settling.remove(uuid);
         Bypass.clear(uuid);
+        DenyDebug.clear(uuid);
 
         appliedGameModes.remove(uuid);
         final GameMode mode = savedGameModes.remove(uuid);
@@ -1412,6 +1459,9 @@ public final class MovementListener implements Listener {
      * lists are compared by identity directly, allocating nothing on the per-move hot path.
      */
     private static boolean isInside(final ApplicableRegionSet outer, final ApplicableRegionSet inner) {
+        if (outer == inner) {
+            return true;
+        }
         for (int i = 0, n = inner.size(); i < n; i++) {
             final ProtectedRegion region = inner.get(i);
             boolean matched = false;

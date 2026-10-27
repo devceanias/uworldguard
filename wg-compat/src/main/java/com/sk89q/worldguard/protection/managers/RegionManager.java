@@ -77,7 +77,7 @@ public final class RegionManager {
 
     public ApplicableRegionSet getApplicableRegions(final BlockVector3 position) {
         com.tricrotism.uworldguard.wgcompat.CompatDiagnostics.REGION_READS.increment();
-        return new com.tricrotism.uworldguard.wgcompat.WrappedRegionSet(
+        return com.tricrotism.uworldguard.wgcompat.WrappedRegionSet.of(
             backing.getApplicableRegions(position.x(), position.y(), position.z()), backing);
     }
 
@@ -187,7 +187,6 @@ public final class RegionManager {
         region.uwgAttach(backing);
         adoptParent(region.uwgBacking());
         backing.addRegion(region.uwgBacking());
-        backing.markDirty();
         com.tricrotism.uworldguard.wgcompat.CompatDiagnostics.REGION_MUTATIONS.increment();
     }
 
@@ -234,7 +233,6 @@ public final class RegionManager {
             removed.add(com.tricrotism.uworldguard.wgcompat.RegionAdapters.region(region, backing));
             backing.removeRegion(region.getId());
         }
-        backing.markDirty();
         com.tricrotism.uworldguard.wgcompat.CompatDiagnostics.REGION_MUTATIONS.increment();
         return removed;
     }
@@ -253,16 +251,20 @@ public final class RegionManager {
     /**
      * Marks this world's regions for save. uWorldGuard writes them out on its own schedule, so this
      * never blocks.
+     *
+     * <p>A flag value edited in place, such as a set a consumer added to, never reached the engine,
+     * and this mark is what saves it. Shared region sets hold that same value object, so they stay
+     * valid and are not retired.
      */
     public void save() throws StorageException {
-        backing.markDirty();
+        backing.uwgMarkUnsaved();
     }
 
     /**
      * @see #save()
      */
     public boolean saveChanges() throws StorageException {
-        backing.markDirty();
+        backing.uwgMarkUnsaved();
         return true;
     }
 
@@ -296,7 +298,6 @@ public final class RegionManager {
             new ArrayList<>(backing.getRegions())) {
             backing.removeRegion(region.getId());
         }
-        backing.markDirty();
         com.tricrotism.uworldguard.wgcompat.CompatDiagnostics.REGION_MUTATIONS.increment();
     }
 

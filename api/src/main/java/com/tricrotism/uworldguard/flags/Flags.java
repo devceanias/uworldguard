@@ -226,6 +226,7 @@ public final class Flags {
     public static final MaterialSetFlag DENY_BLOCK_PLACE = register(FlagCategory.ITEMS, new MaterialSetFlag("deny-block-place"));
     public static final MaterialSetFlag ALLOW_BLOCK_BREAK = register(FlagCategory.ITEMS, new MaterialSetFlag("allow-block-break"));
     public static final MaterialSetFlag DENY_BLOCK_BREAK = register(FlagCategory.ITEMS, new MaterialSetFlag("deny-block-break"));
+    public static final MaterialSetFlag ALLOW_INTERACT = register(FlagCategory.ITEMS, new MaterialSetFlag("allow-interact"));
 
     // Entry restrictions (values may be a number or, with PlaceholderAPI, a %placeholder%).
     public static final StringFlag ENTRY_MIN_LEVEL = register(FlagCategory.ENTRY, new StringFlag("entry-min-level"));
@@ -386,6 +387,25 @@ public final class Flags {
      */
     public static int count() {
         return nextIndex;
+    }
+
+    /**
+     * A bitset over {@link Flag#getIndex()} holding {@code flags}, for
+     * {@code RegionManager.anyRegionUsesAny}. Build it after the flags are registered.
+     */
+    public static long[] mask(final Flag<?>... flags) {
+        int max = 0;
+        for (final Flag<?> flag : flags) {
+            max = Math.max(max, flag.getIndex());
+        }
+        final long[] mask = new long[(max >> 6) + 1];
+        for (final Flag<?> flag : flags) {
+            final int index = flag.getIndex();
+            if (index >= 0) {
+                mask[index >> 6] |= 1L << index;
+            }
+        }
+        return mask;
     }
 
     public static @Nullable Flag<?> get(final String name) {
