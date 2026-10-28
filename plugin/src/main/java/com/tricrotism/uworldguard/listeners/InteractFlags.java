@@ -38,25 +38,93 @@ import java.util.UUID;
         Material.ENDER_CHEST, Material.SMITHING_TABLE, Material.GRINDSTONE, Material.LOOM,
         Material.CARTOGRAPHY_TABLE, Material.STONECUTTER, Material.ENCHANTING_TABLE);
 
+    /**
+     * Blocks that do something when right-clicked. Paper deprecates {@code isInteractable} as not
+     * comprehensive. It errs toward including blocks like stairs, which only costs a denied block use,
+     * and what items do to blocks is covered by {@link #CHANGES_BLOCK}.
+     */
+    private static final Set<Material> REACTS_TO_CLICK = reactsToClick();
+
+    /**
+     * Items whose right-click changes the clicked block itself: tilling, stripping, paths, waxing,
+     * carving, bone meal, lighting, brushing, filling an end portal frame, mud from water, and setting
+     * a spawner's mob.
+     */
+    private static final Set<Material> CHANGES_BLOCK = changesBlock();
+
     private InteractFlags() {
     }
 
     /**
-     * Whether a flag narrower than {@code interact}/{@code use} explicitly allows this block.
+     * Whether right-clicking {@code block} with {@code item} uses the block at all. Clicking stone to
+     * place a block or to throw a wind charge does not, so as in WorldGuard no flag is consulted.
+     */
+    static boolean usesBlock(final Material block, final Material item) {
+        return REACTS_TO_CLICK.contains(block) || CHANGES_BLOCK.contains(item);
+    }
+
+    /**
+     * Whether a denied click must stop the item as well as the block. Only an item that would change
+     * the block, a hoe on dirt for example. Anything else is still used, so a bottle thrown at a
+     * protected door leaves the hand and a block can be placed against it.
+     */
+    static boolean changesBlock(final Material item) {
+        return CHANGES_BLOCK.contains(item);
+    }
+
+    @SuppressWarnings("deprecation")
+    private static Set<Material> reactsToClick() {
+        final Set<Material> blocks = EnumSet.noneOf(Material.class);
+        for (final Material material : Material.values()) {
+            if (!material.isLegacy() && material.isBlock() && material.isInteractable()) {
+                blocks.add(material);
+            }
+        }
+        return blocks;
+    }
+
+    private static Set<Material> changesBlock() {
+        final Set<Material> items = EnumSet.of(Material.BONE_MEAL, Material.FLINT_AND_STEEL,
+            Material.FIRE_CHARGE, Material.SHEARS, Material.HONEYCOMB, Material.BRUSH, Material.ENDER_EYE,
+            Material.POTION);
+        for (final Material material : Material.values()) {
+            final String name = material.name();
+            if (!material.isLegacy() && (name.endsWith("_HOE") || name.endsWith("_AXE")
+                || name.endsWith("_SHOVEL") || name.endsWith("_SPAWN_EGG"))) {
+                items.add(material);
+            }
+        }
+        return items;
+    }
+
+    /**
+     * Whether a flag narrower than {@code interact}/{@code use} explicitly allows this block, either
+     * by listing it in {@code allow-interact} or by setting the block's own flag to allow. {@code type}
+     * is the block's type, which the caller has already read.
      *
      * <p>Only called once the broad check has already decided to deny, so the common case of an
      * allowed interaction never reaches the block-state read that identifies a container.
      */
-    static boolean explicitlyAllowed(final ApplicableRegionSet set, final UUID uuid, final Block block) {
-        final Material type = block.getType();
+    static boolean explicitlyAllowed(
+        final ApplicableRegionSet set, final UUID uuid, final Block block, final Material type
+    ) {
+        if (set.flagSetContains(Flags.ALLOW_INTERACT, type)) {
+            return true;
+        }
         if (type == Material.RESPAWN_ANCHOR) {
             return set.queryExplicitState(Flags.RESPAWN_ANCHORS, uuid) == State.ALLOW;
         }
         if (WORKBENCHES.contains(type)) {
-            return set.queryExplicitState(Flags.PERMIT_WORKBENCHES, uuid) == State.ALLOW
-                || set.queryExplicitState(Flags.USE_ANVIL, uuid) == State.ALLOW;
+            if (set.queryExplicitState(Flags.PERMIT_WORKBENCHES, uuid) == State.ALLOW
+                || set.queryExplicitState(Flags.USE_ANVIL, uuid) == State.ALLOW) {
+                return true;
+            }
+            // An ender chest holds only the opener's own items, so membership has nothing to guard.
+            return type == Material.ENDER_CHEST
+                && set.queryExplicitState(Flags.INTERACT, uuid) != State.DENY
+                && set.queryExplicitState(Flags.USE, uuid) != State.DENY;
         }
-        return block.getState(false) instanceof Container
-            && set.queryExplicitState(Flags.CHEST_ACCESS, uuid) == State.ALLOW;
+        return set.queryExplicitState(Flags.CHEST_ACCESS, uuid) == State.ALLOW
+            && block.getState(false) instanceof Container;
     }
 }

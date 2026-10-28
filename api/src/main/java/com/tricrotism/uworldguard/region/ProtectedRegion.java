@@ -10,9 +10,7 @@ import org.bukkit.entity.Player;
 import org.jspecify.annotations.NullMarked;
 import org.jspecify.annotations.Nullable;
 
-import java.util.Collections;
-import java.util.Map;
-import java.util.UUID;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -29,10 +27,17 @@ public abstract class ProtectedRegion {
     private final String id;
     private final DefaultDomain owners = new DefaultDomain();
     private final DefaultDomain members = new DefaultDomain();
-    private final Map<Flag<?>, Object> flags = new ConcurrentHashMap<>();
-    private final Map<Flag<?>, Object> flagsView = Collections.unmodifiableMap(flags);
-    private final Map<Flag<?>, RegionGroup> flagGroups = new ConcurrentHashMap<>();
-    private final Map<Flag<?>, RegionGroup> flagGroupsView = Collections.unmodifiableMap(flagGroups);
+    /**
+     * Flags set directly on this region, as flag, value, flag, value. Replaced whole under this
+     * region's monitor and read without it. A region sets a handful of flags or none, where a scan
+     * beats hashing.
+     */
+    private volatile Object[] flags = NO_ENTRIES;
+    /**
+     * Group qualifiers, laid out as {@link #flags} is. Almost always empty.
+     */
+    private volatile Object[] flagGroups = NO_ENTRIES;
+    private static final Object[] NO_ENTRIES = new Object[0];
 
     private volatile int priority;
     private volatile @Nullable ProtectedRegion parent;
@@ -141,6 +146,7 @@ public abstract class ProtectedRegion {
 
     public final void setPriority(final int priority) {
         this.priority = priority;
+        edited();
     }
 
     public final @Nullable ProtectedRegion getParent() {
@@ -160,11 +166,21 @@ public abstract class ProtectedRegion {
     private static final Object PARENT_LOCK = new Object();
 
     /**
+     * How many regions name this one as their parent. Written under {@link #PARENT_LOCK}.
+     */
+    private volatile int children;
+
+    /**
      * Set the parent for flag inheritance.
      *
      * @throws IllegalArgumentException if it would create a circular relationship
      */
     public final void setParent(final @Nullable ProtectedRegion parent) {
+        assignParent(parent);
+        edited();
+    }
+
+    private void assignParent(final @Nullable ProtectedRegion parent) {
         synchronized (PARENT_LOCK) {
             if (parent != null) {
                 for (@Nullable ProtectedRegion p = parent; p != null; p = p.parent) {
@@ -173,8 +189,23 @@ public abstract class ProtectedRegion {
                     }
                 }
             }
+            final ProtectedRegion previous = this.parent;
+            if (previous != null) {
+                previous.children--;
+            }
+            if (parent != null) {
+                parent.children++;
+            }
             this.parent = parent;
         }
+    }
+
+    /**
+     * Internal: whether any region names this one as its parent. Lets a removal skip the walk over
+     * every region in the world that unparents children, which for a childless region finds nothing.
+     */
+    public final boolean uwgHasChildren() {
+        return children > 0;
     }
 
     public final DefaultDomain getOwners() {
@@ -262,7 +293,7 @@ public abstract class ProtectedRegion {
     @SuppressWarnings("unchecked")
     public final <T> @Nullable T getFlag(final Flag<T> flag) {
         for (@Nullable ProtectedRegion r = this; r != null; r = r.parent) {
-            final Object value = r.flags.get(flag);
+            final Object value = lookup(r.flags, flag);
             if (value != null) {
                 return (T) value;
             }
@@ -271,12 +302,67 @@ public abstract class ProtectedRegion {
     }
 
     public final <T> void setFlag(final Flag<T> flag, final @Nullable T value) {
-        if (value == null) {
-            flags.remove(flag);
-        } else {
-            flags.put(flag, value);
+        final Object previous = put(false, flag, value);
+        final RegionManager manager = owner;
+        if (manager != null) {
+            manager.flagEdited(this, flag.getIndex(), presenceChange(previous != null, value != null), 0);
         }
-        edited();
+    }
+
+    private static int presenceChange(final boolean before, final boolean after) {
+        return before == after ? 0 : after ? 1 : -1;
+    }
+
+    /**
+     * Flags are equal by name, and the registered instance is almost always the one asked about, so
+     * identity answers first.
+     */
+    private static @Nullable Object lookup(final Object[] table, final Flag<?> flag) {
+        for (int i = 0; i < table.length; i += 2) {
+            final Object key = table[i];
+            if (key == flag || key.equals(flag)) {
+                return table[i + 1];
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Sets {@code flag} to {@code value} in the flag table, or in the group table when {@code groups},
+     * and returns what it held. {@code null} removes it. A flag already there keeps its key.
+     */
+    private synchronized @Nullable Object put(final boolean groups, final Flag<?> flag, final @Nullable Object value) {
+        final Object[] table = groups ? flagGroups : flags;
+        int at = -1;
+        for (int i = 0; i < table.length; i += 2) {
+            if (table[i] == flag || table[i].equals(flag)) {
+                at = i;
+                break;
+            }
+        }
+        final Object previous = at < 0 ? null : table[at + 1];
+        final Object[] out;
+        if (value == null) {
+            if (at < 0) {
+                return null;
+            }
+            out = table.length == 2 ? NO_ENTRIES : new Object[table.length - 2];
+            System.arraycopy(table, 0, out, 0, at);
+            System.arraycopy(table, at + 2, out, at, table.length - at - 2);
+        } else if (at >= 0) {
+            out = table.clone();
+            out[at + 1] = value;
+        } else {
+            out = Arrays.copyOf(table, table.length + 2);
+            out[table.length] = flag;
+            out[table.length + 1] = value;
+        }
+        if (groups) {
+            flagGroups = out;
+        } else {
+            flags = out;
+        }
+        return previous;
     }
 
     /**
@@ -287,22 +373,31 @@ public abstract class ProtectedRegion {
     }
 
     /**
-     * Tells the owning world its flag index and stored document are both out of date. A region not
-     * yet added to a manager has nobody to tell, and needs nobody: adding it retires the index.
+     * Internal: the manager currently holding this region, or {@code null} once it has been removed
+     * or replaced, or before it is added. Plugins should not call this.
+     */
+    public final @Nullable RegionManager uwgOwner() {
+        return owner;
+    }
+
+    /**
+     * Tells the owning world its stored document and shared sets are out of date after a priority or
+     * parent edit. A region not yet added to a manager needs nobody told, since adding it counts what
+     * it holds.
      */
     private void edited() {
         final RegionManager manager = owner;
         if (manager != null) {
-            manager.markDirty();
+            manager.regionEdited(this);
         }
     }
 
     /**
-     * Live, unmodifiable view of flags set directly on this region (no inheritance) —
-     * for storage and display. Mutate through {@link #setFlag}.
+     * The flags set directly on this region (no inheritance) as they are now, for storage and
+     * display. A read-only snapshot: later edits do not show in it. Mutate through {@link #setFlag}.
      */
     public final Map<Flag<?>, Object> getFlags() {
-        return flagsView;
+        return new TableView<>(flags);
     }
 
     /**
@@ -311,13 +406,14 @@ public abstract class ProtectedRegion {
      */
     public final RegionGroup getFlagGroup(final Flag<?> flag) {
         for (@Nullable ProtectedRegion r = this; r != null; r = r.parent) {
-            if (!r.flagGroups.isEmpty()) {
-                final RegionGroup group = r.flagGroups.get(flag);
+            final Object[] groups = r.flagGroups;
+            if (groups.length != 0) {
+                final Object group = lookup(groups, flag);
                 if (group != null) {
-                    return group;
+                    return (RegionGroup) group;
                 }
             }
-            if (r.flags.containsKey(flag)) {
+            if (lookup(r.flags, flag) != null) {
                 return RegionGroup.ALL;
             }
         }
@@ -328,19 +424,86 @@ public abstract class ProtectedRegion {
      * Restrict a flag to a subset of players. {@code null} or {@link RegionGroup#ALL} clears it.
      */
     public final void setFlagGroup(final Flag<?> flag, final @Nullable RegionGroup group) {
-        if (group == null || group == RegionGroup.ALL) {
-            flagGroups.remove(flag);
-        } else {
-            flagGroups.put(flag, group);
+        final boolean qualified = group != null && group != RegionGroup.ALL;
+        final Object previous = put(true, flag, qualified ? group : null);
+        final RegionManager manager = owner;
+        if (manager != null) {
+            manager.flagEdited(this, -1, 0, presenceChange(previous != null, qualified));
         }
-        edited();
     }
 
     /**
-     * Live, unmodifiable view of the group qualifiers set directly on this region — for storage.
+     * The group qualifiers set directly on this region as they are now, for storage. A read-only
+     * snapshot, as {@link #getFlags} is.
      */
     public final Map<Flag<?>, RegionGroup> getFlagGroups() {
-        return flagGroupsView;
+        return new TableView<>(flagGroups);
+    }
+
+    /**
+     * A read-only map over one of the tables, as it was when the view was made.
+     */
+    private static final class TableView<V> extends AbstractMap<Flag<?>, V> {
+        private final Object[] table;
+
+        TableView(final Object[] table) {
+            this.table = table;
+        }
+
+        @Override
+        public int size() {
+            return table.length >> 1;
+        }
+
+        @Override
+        public boolean isEmpty() {
+            return table.length == 0;
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public @Nullable V get(final @Nullable Object key) {
+            return key instanceof Flag<?> flag ? (V) lookup(table, flag) : null;
+        }
+
+        @Override
+        public boolean containsKey(final @Nullable Object key) {
+            return get(key) != null;
+        }
+
+        @Override
+        public Set<Entry<Flag<?>, V>> entrySet() {
+            return new AbstractSet<>() {
+                @Override
+                public Iterator<Entry<Flag<?>, V>> iterator() {
+                    return new Iterator<>() {
+                        private int next;
+
+                        @Override
+                        public boolean hasNext() {
+                            return next < table.length;
+                        }
+
+                        @Override
+                        @SuppressWarnings("unchecked")
+                        public Entry<Flag<?>, V> next() {
+                            if (next >= table.length) {
+                                throw new NoSuchElementException();
+                            }
+                            final Entry<Flag<?>, V> entry =
+                                new SimpleImmutableEntry<>((Flag<?>) table[next], (V) table[next + 1]);
+                            next += 2;
+                            return entry;
+                        }
+                    };
+                }
+
+                @Override
+                public int size() {
+                    return table.length >> 1;
+                }
+            };
+        }
     }
 
     /**
@@ -392,15 +555,30 @@ public abstract class ProtectedRegion {
      * to the old one.
      */
     public final void copyStateFrom(final ProtectedRegion other) {
-        flags.putAll(other.flags);
-        flagGroups.putAll(other.flagGroups);
+        // a redefine copies before its replacement is owned, so only a direct call on a held region
+        // reports the keys it gained, which the flag counts need
+        final RegionManager manager = owner;
+        final Object[] copiedFlags = other.flags;
+        for (int i = 0; i < copiedFlags.length; i += 2) {
+            final Flag<?> flag = (Flag<?>) copiedFlags[i];
+            if (put(false, flag, copiedFlags[i + 1]) == null && manager != null) {
+                manager.flagEdited(this, flag.getIndex(), 1, 0);
+            }
+        }
+        final Object[] copiedGroups = other.flagGroups;
+        for (int i = 0; i < copiedGroups.length; i += 2) {
+            if (put(true, (Flag<?>) copiedGroups[i], copiedGroups[i + 1]) == null && manager != null) {
+                manager.flagEdited(this, -1, 0, 1);
+            }
+        }
         for (final Map.Entry<String, Object> entry : other.getUnresolvedFlags().entrySet()) {
             putUnresolvedFlag(entry.getKey(), entry.getValue());
         }
         copyDomain(other.owners, owners);
         copyDomain(other.members, members);
         priority = other.priority;
-        setParent(other.parent);
+        assignParent(other.parent);
+        edited();
     }
 
     private static void copyDomain(final DefaultDomain from, final DefaultDomain to) {

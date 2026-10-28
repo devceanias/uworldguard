@@ -19,8 +19,9 @@ import java.util.*;
  * A protected region, backed one-to-one by a uWorldGuard
  * {@code com.tricrotism.uworldguard.region.ProtectedRegion}.
  *
- * <p>Every mutation is written straight through to the engine region and marks the owning world
- * dirty, because engine edits do not persist by themselves. A region built by a consumer
+ * <p>Every mutation is written straight through to the engine region. Flag, priority and parent edits
+ * reach the owning world from the engine itself. Owner and member edits do not, so those mark the
+ * world dirty from here. A region built by a consumer
  * ({@code new ProtectedCuboidRegion(...)}) is detached: it has a backing engine region from the
  * start but no manager until {@code RegionManager.addRegion} attaches one.
  *
@@ -122,7 +123,7 @@ public abstract class ProtectedRegion implements ChangeTracked, Comparable<Prote
 
     public void setPriority(final int priority) {
         backing.setPriority(priority);
-        markDirty();
+        touched();
     }
 
     public ProtectedRegion getParent() {
@@ -130,18 +131,33 @@ public abstract class ProtectedRegion implements ChangeTracked, Comparable<Prote
         return parent == null ? null : com.tricrotism.uworldguard.wgcompat.RegionAdapters.region(parent, manager);
     }
 
+    /**
+     * @throws IllegalArgumentException if this region and {@code parent} are held by different
+     *                                  worlds. Flag resolution assumes a parent lives in its child's
+     *                                  world, and removing the parent in its own world would never
+     *                                  unparent this region. A detached region may take any parent,
+     *                                  as under WorldGuard.
+     */
     public void setParent(final ProtectedRegion parent) throws CircularInheritanceException {
+        if (parent != null) {
+            final com.tricrotism.uworldguard.region.RegionManager world = backing.uwgOwner();
+            final com.tricrotism.uworldguard.region.RegionManager parentWorld = parent.backing.uwgOwner();
+            if (world != null && parentWorld != null && world != parentWorld) {
+                throw new IllegalArgumentException("Region '" + parent.getId()
+                    + "' belongs to another world and cannot be the parent of '" + getId() + "'");
+            }
+        }
         try {
             backing.setParent(parent == null ? null : parent.backing);
         } catch (final IllegalArgumentException circular) {
             throw new CircularInheritanceException();
         }
-        markDirty();
+        touched();
     }
 
     public void clearParent() {
         backing.setParent(null);
-        markDirty();
+        touched();
     }
 
     public DefaultDomain getOwners() {
@@ -152,14 +168,23 @@ public abstract class ProtectedRegion implements ChangeTracked, Comparable<Prote
         return members;
     }
 
+    /**
+     * Replaces the owners with those of {@code owners}. The domain object is never swapped, so
+     * handing back {@link #getOwners()} after editing it, as WorldGuard code does, leaves it as is.
+     */
     public void setOwners(final DefaultDomain owners) {
-        this.owners.clear();
-        this.owners.addAll(owners);
+        if (owners != this.owners) {
+            this.owners.uwgReplace(owners);
+        }
     }
 
+    /**
+     * @see #setOwners(DefaultDomain)
+     */
     public void setMembers(final DefaultDomain members) {
-        this.members.clear();
-        this.members.addAll(members);
+        if (members != this.members) {
+            this.members.uwgReplace(members);
+        }
     }
 
     public boolean hasMembersOrOwners() {
@@ -230,6 +255,7 @@ public abstract class ProtectedRegion implements ChangeTracked, Comparable<Prote
             final com.tricrotism.uworldguard.flags.Flag<?> owner = groupFlag.uwgOwner();
             if (owner != null) {
                 backing.setFlagGroup(owner, com.tricrotism.uworldguard.wgcompat.FlagBridge.toEngineGroup(val));
+                touched();
             }
         } else {
             final com.tricrotism.uworldguard.flags.Flag<Object> engine =
@@ -237,9 +263,9 @@ public abstract class ProtectedRegion implements ChangeTracked, Comparable<Prote
             if (engine != null) {
                 backing.setFlag(engine,
                     com.tricrotism.uworldguard.wgcompat.FlagBridge.toEngineValue(flag, val));
+                touched();
             }
         }
-        markDirty();
     }
 
     /**
@@ -272,7 +298,7 @@ public abstract class ProtectedRegion implements ChangeTracked, Comparable<Prote
                 setFlag((Flag) entry.getKey(), entry.getValue());
             }
         }
-        markDirty();
+        touched();
     }
 
     public void copyFrom(final ProtectedRegion other) {
@@ -282,7 +308,7 @@ public abstract class ProtectedRegion implements ChangeTracked, Comparable<Prote
         setFlags(other.getFlags());
         try {
             setParent(other.getParent());
-        } catch (final CircularInheritanceException ignored) {
+        } catch (final CircularInheritanceException | IllegalArgumentException ignored) {
             // The source region's parent chain cannot be reused here; leave this region's parent alone.
         }
     }
@@ -369,15 +395,23 @@ public abstract class ProtectedRegion implements ChangeTracked, Comparable<Prote
     }
 
     /**
-     * Internal: records a mutation and marks the owning world for save.
+     * Internal: records a mutation and marks the owning world for save. For owner and member edits,
+     * which the engine does not report.
      */
     protected final void markDirty() {
-        dirty = true;
-        com.tricrotism.uworldguard.wgcompat.CompatDiagnostics.REGION_MUTATIONS.increment();
+        touched();
         final com.tricrotism.uworldguard.region.RegionManager owner = manager;
         if (owner != null) {
-            owner.markDirty();
+            owner.uwgMarkUnsaved();
         }
+    }
+
+    /**
+     * Records a mutation the engine region has already reported to its world.
+     */
+    private void touched() {
+        dirty = true;
+        com.tricrotism.uworldguard.wgcompat.CompatDiagnostics.REGION_MUTATIONS.increment();
     }
 
     private void setMinMaxFromBacking() {

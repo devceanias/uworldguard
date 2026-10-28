@@ -109,9 +109,13 @@ public final class RegionEditorImpl implements RegionEditor {
             world, region, flag, current, value, currentGroup, nextGroup, actor))) {
             return EditResult.CANCELLED;
         }
-        region.setFlag(flag, value);
-        region.setFlagGroup(flag, nextGroup);
-        manager.markDirty();
+        // Note: we wanna read this again, since a listener may have edited the region during the event
+        if (!Objects.equals(region.getFlags().get(flag), value)) {
+            region.setFlag(flag, value);
+        }
+        if (directGroup(region, flag) != nextGroup) {
+            region.setFlagGroup(flag, nextGroup);
+        }
         return EditResult.APPLIED;
     }
 
@@ -135,7 +139,6 @@ public final class RegionEditorImpl implements RegionEditor {
             return EditResult.CANCELLED;
         }
         region.setFlagGroup(flag, group);
-        manager.markDirty();
         return EditResult.APPLIED;
     }
 
@@ -168,7 +171,6 @@ public final class RegionEditorImpl implements RegionEditor {
         for (final RegionPriorityChangeEvent change : changes) {
             change.getRegion().setPriority(change.getNewPriority());
         }
-        manager.markDirty();
         return EditResult.APPLIED;
     }
 
@@ -194,7 +196,6 @@ public final class RegionEditorImpl implements RegionEditor {
         } catch (final IllegalArgumentException _) {
             return EditResult.INVALID;
         }
-        manager.markDirty();
         return EditResult.APPLIED;
     }
 
@@ -235,7 +236,36 @@ public final class RegionEditorImpl implements RegionEditor {
         } else {
             domain.removePlayer(player);
         }
-        manager.markDirty();
+        manager.uwgMarkUnsaved();
+        return EditResult.APPLIED;
+    }
+
+    /**
+     * Trusts or untrusts everyone holding the permission group {@code group}, the {@code g:} form of
+     * the member commands. Vetoable through {@link RegionMembershipChangeEvent} like a player edit.
+     */
+    public EditResult setGroupTrusted(
+        final ProtectedRegion region, final RegionMembershipChangeEvent.Role role, final String group,
+        final boolean add, final @Nullable CommandSender actor
+    ) {
+        if (!owns(region)) {
+            return EditResult.NOT_FOUND;
+        }
+        final DefaultDomain domain = role == RegionMembershipChangeEvent.Role.OWNER
+            ? region.getOwners()
+            : region.getMembers();
+        if (domain.containsGroup(group) == add) {
+            return EditResult.UNCHANGED;
+        }
+        if (RegionEdits.vetoed(new RegionMembershipChangeEvent(world, region, role, group, add, actor))) {
+            return EditResult.CANCELLED;
+        }
+        if (add) {
+            domain.addGroup(group);
+        } else {
+            domain.removeGroup(group);
+        }
+        manager.uwgMarkUnsaved();
         return EditResult.APPLIED;
     }
 

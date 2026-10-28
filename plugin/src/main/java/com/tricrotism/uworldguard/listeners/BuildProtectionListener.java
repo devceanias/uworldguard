@@ -1,7 +1,5 @@
 package com.tricrotism.uworldguard.listeners;
 
-import com.sk89q.worldguard.bukkit.protection.events.DisallowedPVPEvent;
-import com.sk89q.worldguard.bukkit.util.Events;
 import com.tricrotism.uworldguard.config.Bypass;
 import com.tricrotism.uworldguard.config.EventGate;
 import com.tricrotism.uworldguard.config.InteractionWhitelist;
@@ -11,18 +9,26 @@ import com.tricrotism.uworldguard.flags.State;
 import com.tricrotism.uworldguard.flags.StateFlag;
 import com.tricrotism.uworldguard.region.ApplicableRegionSet;
 import com.tricrotism.uworldguard.region.RegionQuery;
+import com.tricrotism.uworldguard.text.DenyDebug;
 import com.tricrotism.uworldguard.text.MessageService;
+import org.bukkit.Bukkit;
+import org.bukkit.Location;
 import org.bukkit.Material;
+import org.bukkit.World;
 import org.bukkit.block.Block;
+import org.bukkit.block.BlockState;
 import org.bukkit.block.data.Waterlogged;
 import org.bukkit.entity.*;
+import org.bukkit.event.Event;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
 import org.bukkit.event.block.BlockBreakEvent;
+import org.bukkit.event.block.BlockMultiPlaceEvent;
 import org.bukkit.event.block.BlockPlaceEvent;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
+import org.bukkit.event.entity.EntityInteractEvent;
 import org.bukkit.event.entity.EntityPlaceEvent;
 import org.bukkit.event.hanging.HangingPlaceEvent;
 import org.bukkit.event.player.PlayerBucketEmptyEvent;
@@ -30,9 +36,12 @@ import org.bukkit.event.player.PlayerBucketEvent;
 import org.bukkit.event.player.PlayerBucketFillEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.inventory.EquipmentSlot;
-import org.bukkit.projectiles.ProjectileSource;
+import org.bukkit.util.BoundingBox;
 import org.jspecify.annotations.NullMarked;
-import org.jspecify.annotations.Nullable;
+
+import java.util.EnumSet;
+import java.util.Set;
+import java.util.UUID;
 
 /**
  * Enforces the build, block-break, block-place, interact, use, and pvp flags — including the two
@@ -40,6 +49,11 @@ import org.jspecify.annotations.Nullable;
  */
 @NullMarked
 public final class BuildProtectionListener implements Listener {
+
+    /**
+     * Blocks an entity triggers by touching them: every pressure plate, and tripwire.
+     */
+    private static final Set<Material> TRIGGERS = triggers();
 
     private final RegionQuery query;
     private final MessageService messages;
@@ -57,13 +71,14 @@ public final class BuildProtectionListener implements Listener {
         final Player player = event.getPlayer();
         final Block block = event.getBlock();
         final ApplicableRegionSet set = query.getApplicableRegions(block);
-        final Material type = block.getType();
+        final Material type = set.worldUses(Flags.DENY_BLOCK_BREAK) || set.worldUses(Flags.ALLOW_BLOCK_BREAK)
+            ? block.getType() : Material.AIR;
         if (set.flagSetContains(Flags.DENY_BLOCK_BREAK, type)) {
             if (Bypass.has(player)) {
                 return;
             }
             event.setCancelled(true);
-            messages.sendDeny(player, Flags.BLOCK_BREAK, set.queryValue(Flags.DENY_MESSAGE));
+            messages.sendRegionDeny(player, Flags.BLOCK_BREAK, set);
             return;
         }
         if (set.flagSetContains(Flags.ALLOW_BLOCK_BREAK, type)) {
@@ -74,7 +89,7 @@ public final class BuildProtectionListener implements Listener {
                 return;
             }
             event.setCancelled(true);
-            messages.sendDeny(player, Flags.BLOCK_BREAK, set.queryValue(Flags.DENY_MESSAGE));
+            messages.sendRegionDeny(player, Flags.BLOCK_BREAK, set);
         }
     }
 
@@ -86,25 +101,73 @@ public final class BuildProtectionListener implements Listener {
         final Player player = event.getPlayer();
         final Block block = event.getBlock();
         final ApplicableRegionSet set = query.getApplicableRegions(block);
-        final Material type = block.getType();
-        if (set.flagSetContains(Flags.DENY_BLOCK_PLACE, type)) {
-            if (Bypass.has(player)) {
-                return;
-            }
+        final Material type = set.worldUses(Flags.DENY_BLOCK_PLACE) || set.worldUses(Flags.ALLOW_BLOCK_PLACE)
+            ? block.getType() : Material.AIR;
+        if (placeRefused(set, player, type)) {
             event.setCancelled(true);
-            messages.sendDeny(player, Flags.BLOCK_PLACE, set.queryValue(Flags.DENY_MESSAGE));
+            stopGhostClimb(player, block);
             return;
         }
-        if (set.flagSetContains(Flags.ALLOW_BLOCK_PLACE, type)) {
+        // A bed or door also fills a second position, which may lie in another region.
+        if (event instanceof BlockMultiPlaceEvent multi) {
+            for (final BlockState replaced : multi.getReplacedBlockStates()) {
+                final int x = replaced.getX();
+                final int y = replaced.getY();
+                final int z = replaced.getZ();
+                if ((x != block.getX() || y != block.getY() || z != block.getZ())
+                    && placeRefused(query.getApplicableRegions(block.getWorld(), x, y, z), player, type)) {
+                    event.setCancelled(true);
+                    stopGhostClimb(player, block);
+                    return;
+                }
+            }
+        }
+    }
+
+    /**
+     * The placer's client shows a refused block until the correction arrives, so a player who jumps
+     * and places under their own feet can climb on air. Dropping them to where it would have sat
+     * takes back the height, unless something real still holds them up.
+     */
+    private static void stopGhostClimb(final Player player, final Block block) {
+        if (player.isFlying()) {
             return;
         }
-        if (!set.testBuild(player.getUniqueId(), Flags.BLOCK_PLACE)) {
-            if (Bypass.has(player)) {
-                return;
-            }
-            event.setCancelled(true);
-            messages.sendDeny(player, Flags.BLOCK_PLACE, set.queryValue(Flags.DENY_MESSAGE));
+        final BoundingBox box = player.getBoundingBox();
+        final int bx = block.getX();
+        final int y = block.getY();
+        final int bz = block.getZ();
+        final double gap = box.getMinY() - (y + 1);
+        if (gap < -0.001 || gap > 1.5
+            || box.getMinX() >= bx + 1 || box.getMaxX() <= bx
+            || box.getMinZ() >= bz + 1 || box.getMaxZ() <= bz) {
+            return;
         }
+        final World world = player.getWorld();
+        for (int x = (int) Math.floor(box.getMinX()); x < box.getMaxX(); x++) {
+            for (int z = (int) Math.floor(box.getMinZ()); z < box.getMaxZ(); z++) {
+                if ((x != bx || z != bz) && world.getType(x, y, z).isSolid()) {
+                    return;
+                }
+            }
+        }
+        final Location to = player.getLocation();
+        to.setY(y);
+        player.teleportAsync(to);
+    }
+
+    /**
+     * Whether placing {@code type} here is refused, telling the player when it is.
+     */
+    private boolean placeRefused(final ApplicableRegionSet set, final Player player, final Material type) {
+        final boolean refused = set.flagSetContains(Flags.DENY_BLOCK_PLACE, type)
+            || (!set.flagSetContains(Flags.ALLOW_BLOCK_PLACE, type)
+            && !set.testBuild(player.getUniqueId(), Flags.BLOCK_PLACE));
+        if (!refused || Bypass.has(player)) {
+            return false;
+        }
+        messages.sendRegionDeny(player, Flags.BLOCK_PLACE, set);
+        return true;
     }
 
     /**
@@ -174,15 +237,14 @@ public final class BuildProtectionListener implements Listener {
             return;
         }
         event.setCancelled(true);
-        messages.sendDeny(player, explicit == State.DENY ? bucket : flag,
-            set.queryValue(Flags.DENY_MESSAGE));
+        messages.sendRegionDeny(player, explicit == State.DENY ? bucket : flag, set);
     }
 
     /**
      * The block a filled bucket puts into the world. Mob buckets carry water with them, so they
      * count as placing water.
      */
-    private static Material fluidOf(final Material bucket) {
+    static Material fluidOf(final Material bucket) {
         return switch (bucket) {
             case LAVA_BUCKET -> Material.LAVA;
             case POWDER_SNOW_BUCKET -> Material.POWDER_SNOW;
@@ -198,7 +260,7 @@ public final class BuildProtectionListener implements Listener {
      * water — reading the block's own type here would judge the pickup against the container and force
      * every waterloggable block onto the break list to make buckets work.
      */
-    private static Material fluidIn(final Block block) {
+    static Material fluidIn(final Block block) {
         final Material type = block.getType();
         if (type == Material.WATER || type == Material.LAVA || type == Material.POWDER_SNOW) {
             return type;
@@ -229,7 +291,7 @@ public final class BuildProtectionListener implements Listener {
             return;
         }
         event.setCancelled(true);
-        messages.sendDeny(player, Flags.BLOCK_PLACE, set.queryValue(Flags.DENY_MESSAGE));
+        messages.sendRegionDeny(player, Flags.BLOCK_PLACE, set);
     }
 
     /**
@@ -258,9 +320,15 @@ public final class BuildProtectionListener implements Listener {
             return;
         }
         event.setCancelled(true);
-        messages.sendDeny(player, Flags.BLOCK_PLACE, set.queryValue(Flags.DENY_MESSAGE));
+        messages.sendRegionDeny(player, Flags.BLOCK_PLACE, set);
     }
 
+    /**
+     * {@code interact}/{@code use} for right-clicking a block, the way WorldGuard judges it. A click
+     * that uses nothing, such as placing a block on the floor or throwing a wind charge at it, is not
+     * an interaction, so {@code block-place} alone decides placement. A refused click denies the
+     * block's own use and leaves the held item usable, unless that item would change the block.
+     */
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     public void onInteract(final PlayerInteractEvent event) {
         if (EventGate.disabled(event)) {
@@ -270,7 +338,9 @@ public final class BuildProtectionListener implements Listener {
         if (event.getAction() != Action.RIGHT_CLICK_BLOCK || block == null || event.getHand() != EquipmentSlot.HAND) {
             return;
         }
-        if (InteractionWhitelist.allows(block.getWorld(), block.getType())) {
+        final Material item = event.getMaterial();
+        final Material type = block.getType();
+        if (!InteractFlags.usesBlock(type, item) || InteractionWhitelist.allows(block.getWorld(), type)) {
             return;
         }
         final Player player = event.getPlayer();
@@ -279,12 +349,84 @@ public final class BuildProtectionListener implements Listener {
             if (Bypass.has(player)) {
                 return;
             }
-            if (InteractFlags.explicitlyAllowed(set, player.getUniqueId(), block)) {
+            if (InteractFlags.explicitlyAllowed(set, player.getUniqueId(), block, type)) {
                 return;
             }
-            event.setCancelled(true);
-            messages.sendDeny(player, Flags.INTERACT, set.queryValue(Flags.DENY_MESSAGE));
+            if (InteractFlags.changesBlock(item)) {
+                event.setCancelled(true);
+            } else {
+                event.setUseInteractedBlock(Event.Result.DENY);
+            }
+            messages.sendRegionDeny(player, Flags.INTERACT, set);
         }
+    }
+
+    /**
+     * Pressure plates and tripwire answer to {@code interact}/{@code use} like a button does, so a
+     * non-member cannot open a protected door by stepping on its plate. Nothing is sent to the player,
+     * since the event repeats every tick they stand there. No narrower flag covers these blocks, so
+     * {@link InteractFlags#explicitlyAllowed} is not consulted.
+     */
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    public void onStep(final PlayerInteractEvent event) {
+        if (event.getAction() != Action.PHYSICAL) {
+            return;
+        }
+        final Block block = event.getClickedBlock();
+        if (block == null) {
+            return;
+        }
+        final Material type = block.getType();
+        if (!TRIGGERS.contains(type) || EventGate.disabled(event)) {
+            return;
+        }
+        final Player player = event.getPlayer();
+        if (!mayTrigger(block, type, player.getUniqueId()) && !Bypass.has(player)) {
+            event.setCancelled(true);
+        }
+    }
+
+    /**
+     * The same check for an arrow a player shot or an item a player threw onto the plate. Mobs are
+     * left alone, which mob farms rely on.
+     */
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    public void onEntityStep(final EntityInteractEvent event) {
+        final Block block = event.getBlock();
+        final Material type = block.getType();
+        if (!TRIGGERS.contains(type) || EventGate.disabled(event)) {
+            return;
+        }
+        final Entity entity = event.getEntity();
+        if (entity instanceof Projectile projectile) {
+            if (projectile.getShooter() instanceof Player shooter
+                && !mayTrigger(block, type, shooter.getUniqueId()) && !Bypass.has(shooter)) {
+                event.setCancelled(true);
+            }
+        } else if (entity instanceof Item item) {
+            final UUID thrower = item.getThrower();
+            if (thrower != null && !mayTrigger(block, type, thrower)) {
+                final Player player = Bukkit.getPlayer(thrower);
+                if (player == null || !Bypass.has(player)) {
+                    event.setCancelled(true);
+                }
+            }
+        }
+    }
+
+    private boolean mayTrigger(final Block block, final Material type, final UUID uuid) {
+        return InteractionWhitelist.allows(block.getWorld(), type)
+            || query.getApplicableRegions(block).testBuild(uuid, Flags.INTERACT, Flags.USE);
+    }
+
+    private static Set<Material> triggers() {
+        final Set<Material> triggers = EnumSet.of(Material.TRIPWIRE);
+        for (final Material material : Material.values()) {
+            if (!material.isLegacy() && material.name().endsWith("_PRESSURE_PLATE")) {
+                triggers.add(material);
+            }
+        }
+        return triggers;
     }
 
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
@@ -292,35 +434,27 @@ public final class BuildProtectionListener implements Listener {
         if (EventGate.disabled(event)) {
             return;
         }
-        if (!(event.getEntity() instanceof Player defender)) {
+        if (!(event.getEntity() instanceof Player defender) || !query.usesFlag(defender.getWorld(), Flags.PVP)) {
             return;
         }
-        final Player attacker = resolvePlayer(event.getDamager());
-        if (attacker == null) {
+        final Player attacker = Attackers.of(event.getDamager());
+        if (attacker == null || attacker.equals(defender)) {
             return;
         }
-        if (!query.getApplicableRegions(defender)
-            .testState(Flags.PVP, attacker.getUniqueId())) {
+        if (!query.getApplicableRegions(defender).testState(Flags.PVP, attacker.getUniqueId())
+            || !query.getApplicableRegions(attacker).testState(Flags.PVP, attacker.getUniqueId())) {
             if (Bypass.has(attacker)) {
                 return;
             }
-            if (Events.fireAndTestCancel(new DisallowedPVPEvent(attacker, defender, event))) {
+            if (Attackers.pvpRefusalOverridden(attacker, defender, event)) {
                 return;
             }
             event.setCancelled(true);
-        }
-    }
-
-    private static @Nullable Player resolvePlayer(final Object damager) {
-        if (damager instanceof Player p) {
-            return p;
-        }
-        if (damager instanceof Projectile projectile) {
-            final ProjectileSource shooter = projectile.getShooter();
-            if (shooter instanceof Player p) {
-                return p;
+            if (DenyDebug.watching(attacker)) {
+                final ApplicableRegionSet at = query.getApplicableRegions(defender);
+                DenyDebug.explain(attacker, Flags.PVP, at.testState(Flags.PVP, attacker.getUniqueId())
+                    ? query.getApplicableRegions(attacker) : at);
             }
         }
-        return null;
     }
 }

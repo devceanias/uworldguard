@@ -60,7 +60,8 @@ public final class InteractionListener implements Listener {
         if (EventGate.disabled(event)) {
             return;
         }
-        if (!query.testState(event.getEntity(), Flags.SHEAR)) {
+        final Entity entity = event.getEntity();
+        if (query.usesFlag(entity.getWorld(), Flags.SHEAR) && !query.testState(entity, Flags.SHEAR)) {
             event.setCancelled(true);
         }
     }
@@ -175,7 +176,7 @@ public final class InteractionListener implements Listener {
             return;
         }
         event.setCancelled(true);
-        messages.sendDeny(player, Flags.CHEST_ACCESS, set.queryValue(Flags.DENY_MESSAGE));
+        messages.sendRegionDeny(player, Flags.CHEST_ACCESS, set);
     }
 
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
@@ -230,7 +231,9 @@ public final class InteractionListener implements Listener {
     private void denyAt(
         final Cancellable event, final Player player, final Block target, final StateFlag flag
     ) {
-        if (query.getApplicableRegions(target).testBuild(player.getUniqueId(), flag) || Bypass.has(player)) {
+        final ApplicableRegionSet set = query.getApplicableRegions(target);
+        if (set.testBuild(player.getUniqueId(), flag) || Bypass.has(player)
+            || set.flagSetContains(Flags.ALLOW_INTERACT, target.getType())) {
             return;
         }
         event.setCancelled(true);

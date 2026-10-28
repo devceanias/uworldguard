@@ -62,7 +62,7 @@ public final class CommandListener implements Listener {
 
         if (hasBlocked
             && (set.flagSetContains(Flags.BLOCKED_CMDS, qualified)
-            || set.flagSetContains(Flags.BLOCKED_CMDS, bare))) {
+            || colon >= 0 && set.flagSetContains(Flags.BLOCKED_CMDS, bare))) {
             event.setCancelled(true);
             messages.sendDeny(player, Flags.BLOCKED_CMDS);
             return;
@@ -70,7 +70,7 @@ public final class CommandListener implements Listener {
 
         if (hasAllowed) {
             final Set<String> allowed = set.queryValue(Flags.ALLOWED_CMDS);
-            if (allowed != null && !allowed.contains(qualified) && !allowed.contains(bare)) {
+            if (allowed != null && !allowed.contains(qualified) && (colon < 0 || !allowed.contains(bare))) {
                 event.setCancelled(true);
                 messages.sendDeny(player, Flags.BLOCKED_CMDS);
             }

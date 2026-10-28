@@ -6,6 +6,7 @@ import com.tricrotism.uworldguard.flags.State;
 import com.tricrotism.uworldguard.util.BlockVector3;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -30,6 +31,98 @@ class RegionEngineTest {
 
         assertTrue(first.isEmpty());
         assertSame(first, second, "the empty result is cached, not rebuilt per query");
+    }
+
+    @Test
+    void pointsInTheSameRegionsShareOneSet() {
+        final RegionManager manager = new RegionManager();
+        manager.addRegion(cuboid("claim", 0, 0, 15, 15));
+
+        assertSame(manager.getApplicableRegions(2, 64, 2), manager.getApplicableRegions(12, 70, 9));
+    }
+
+    @Test
+    void aSetHeldAcrossAFlagEditAnswersWithTheNewValue() {
+        final RegionManager manager = new RegionManager();
+        final ProtectedCuboidRegion claim = cuboid("claim", 0, 0, 15, 15);
+        claim.setFlag(Flags.TNT, State.DENY);
+        claim.setFlag(Flags.GREETING, "hello");
+        manager.addRegion(claim);
+        final ApplicableRegionSet held = manager.getApplicableRegions(8, 64, 8);
+        assertEquals(State.ALLOW, held.queryState(Flags.PVP), "memoised as unset");
+        assertEquals("hello", held.queryValue(Flags.GREETING));
+        assertFalse(held.worldUses(Flags.PVP));
+
+        claim.setFlag(Flags.PVP, State.DENY);
+        claim.setFlag(Flags.GREETING, "welcome");
+
+        assertTrue(held.worldUses(Flags.PVP));
+        assertEquals(State.DENY, held.queryState(Flags.PVP));
+        assertEquals("welcome", held.queryValue(Flags.GREETING));
+        assertEquals(State.DENY, manager.getApplicableRegions(8, 64, 8).queryState(Flags.PVP));
+    }
+
+    @Test
+    void copyingStateOntoAHeldRegionRetiresSetsHoldingItsOldValues() {
+        final RegionManager manager = new RegionManager();
+        final ProtectedCuboidRegion claim = cuboid("claim", 0, 0, 15, 15);
+        claim.setFlag(Flags.PVP, State.ALLOW);
+        manager.addRegion(claim);
+        assertEquals(State.ALLOW, manager.getApplicableRegions(8, 64, 8).queryState(Flags.PVP));
+        manager.clearDirty();
+        final ProtectedCuboidRegion template = cuboid("template", 100, 100, 115, 115);
+        template.setFlag(Flags.PVP, State.DENY);
+
+        claim.copyStateFrom(template);
+
+        assertEquals(State.DENY, manager.getApplicableRegions(8, 64, 8).queryState(Flags.PVP),
+            "an overwritten value reaches the shared set");
+        assertTrue(manager.clearDirty(), "the world is marked for saving");
+    }
+
+    @Test
+    void aPriorityChangeAfterALookupReordersTheSharedSet() {
+        final RegionManager manager = new RegionManager();
+        final ProtectedCuboidRegion outer = cuboid("outer", 0, 0, 15, 15);
+        outer.setFlag(Flags.PVP, State.ALLOW);
+        final ProtectedCuboidRegion inner = cuboid("inner", 0, 0, 15, 15);
+        inner.setFlag(Flags.PVP, State.DENY);
+        inner.setPriority(10);
+        manager.addRegion(outer);
+        manager.addRegion(inner);
+        assertEquals(State.DENY, manager.getApplicableRegions(8, 64, 8).queryState(Flags.PVP));
+
+        outer.setPriority(20);
+
+        assertEquals(State.ALLOW, manager.getApplicableRegions(8, 64, 8).queryState(Flags.PVP),
+            "a set still sorted the old way meets the deny first and keeps it");
+    }
+
+    @Test
+    void aGroupQualifierAddedAfterALookupIsHonoured() {
+        final RegionManager manager = new RegionManager();
+        final UUID member = UUID.randomUUID();
+        final ProtectedCuboidRegion town = cuboid("town", 0, 0, 15, 15);
+        town.getMembers().addPlayer(member);
+        town.setFlag(Flags.PVP, State.DENY);
+        manager.addRegion(town);
+        assertEquals(State.DENY, manager.getApplicableRegions(8, 64, 8).queryState(Flags.PVP, member));
+
+        town.setFlagGroup(Flags.PVP, RegionGroup.NON_MEMBERS);
+
+        assertEquals(State.ALLOW, manager.getApplicableRegions(8, 64, 8).queryState(Flags.PVP, member));
+    }
+
+    @Test
+    void aRegionAddedAfterALookupJoinsTheSet() {
+        final RegionManager manager = new RegionManager();
+        manager.addRegion(cuboid("claim", 0, 0, 15, 15));
+        assertEquals(1, manager.getApplicableRegions(8, 64, 8).size());
+
+        manager.addRegion(cuboid("event", 4, 4, 10, 10));
+
+        assertEquals(2, manager.getApplicableRegions(8, 64, 8).size());
+        assertEquals(1, manager.getApplicableRegions(2, 64, 2).size());
     }
 
     @Test
@@ -254,6 +347,28 @@ class RegionEngineTest {
     }
 
     @Test
+    void aPassthroughRegionAboveAClaimLeavesTheClaimToDecide() {
+        final UUID member = UUID.randomUUID();
+        final UUID stranger = UUID.randomUUID();
+        final ProtectedCuboidRegion cover = cuboid("cover", 0, 0, 64, 64);
+        cover.setFlag(Flags.PASSTHROUGH, State.ALLOW);
+        cover.setPriority(10);
+        final ProtectedCuboidRegion claim = cuboid("claim", 0, 0, 32, 32);
+        claim.getMembers().addPlayer(member);
+
+        final ApplicableRegionSet covered = new ApplicableRegionSet(List.of(cover, claim), null);
+        assertFalse(covered.canBuild(stranger));
+        assertTrue(covered.canBuild(member), "the claim below the passthrough region is the top");
+
+        final ProtectedCuboidRegion sibling = cuboid("sibling", 0, 0, 32, 32);
+        sibling.setFlag(Flags.PASSTHROUGH, State.ALLOW);
+        sibling.setFlag(Flags.BUILD, State.ALLOW);
+        final ApplicableRegionSet withSibling = new ApplicableRegionSet(List.of(cover, claim, sibling), null);
+        assertFalse(withSibling.canBuild(stranger), "a passthrough sibling's build flag takes no part");
+        assertTrue(withSibling.canBuild(member));
+    }
+
+    @Test
     void aRegionAddedAfterAQueryInThatChunkIsSeen() {
         final RegionManager manager = new RegionManager();
         assertTrue(manager.getApplicableRegions(16, 64, 16).isEmpty());
@@ -361,6 +476,110 @@ class RegionEngineTest {
     }
 
     @Test
+    void removingOrReplacingAParentStillReachesItsChildrenAfterAReparent() {
+        final RegionManager manager = new RegionManager();
+        final ProtectedCuboidRegion first = cuboid("first", 0, 0, 64, 64);
+        final ProtectedCuboidRegion second = cuboid("second", 0, 0, 64, 64);
+        final ProtectedCuboidRegion child = cuboid("child", 8, 8, 16, 16);
+        manager.addRegion(first);
+        manager.addRegion(second);
+        manager.addRegion(child);
+        child.setParent(first);
+        child.setParent(second);
+
+        manager.removeRegion("first");
+        assertSame(second, child.getParent(), "first lost its only child to the reparent");
+
+        final ProtectedCuboidRegion replacement = cuboid("second", 0, 0, 128, 128);
+        manager.addRegion(replacement);
+        assertSame(replacement, child.getParent());
+
+        manager.removeRegion("second");
+        assertNull(child.getParent());
+    }
+
+    @Test
+    void editsThroughAReplacedInstanceNoLongerReachTheWorld() {
+        final RegionManager manager = new RegionManager();
+        final ProtectedCuboidRegion added = cuboid("plot", 0, 0, 32, 32);
+        manager.addRegion(added);
+        final ProtectedCuboidRegion redefined = cuboid("plot", 0, 0, 64, 64);
+        manager.addRegion(redefined);
+        manager.redefineRegion(cuboid("plot", 0, 0, 128, 128));
+        manager.clearDirty();
+
+        added.setFlag(Flags.PVP, State.DENY);
+        redefined.setFlag(Flags.PVP, State.DENY);
+
+        assertFalse(manager.clearDirty(), "a dead instance must not mark the world dirty");
+        assertFalse(manager.anyRegionUses(Flags.PVP));
+    }
+
+    @Test
+    void replacingAChildReleasesItsParent() {
+        final RegionManager manager = new RegionManager();
+        final ProtectedCuboidRegion parent = cuboid("mall", 0, 0, 64, 64);
+        final ProtectedCuboidRegion child = cuboid("shop", 8, 8, 24, 24);
+        child.setParent(parent);
+        manager.addRegion(parent);
+        manager.addRegion(child);
+
+        manager.redefineRegion(cuboid("shop", 8, 8, 32, 32));
+        assertTrue(parent.uwgHasChildren(), "the redefined child still names it");
+
+        manager.addRegion(cuboid("shop", 8, 8, 32, 32));
+        assertFalse(parent.uwgHasChildren(), "no region names it any more");
+    }
+
+    @Test
+    void mixedCaseIdsFollowReplacementAndRemoval() {
+        final RegionManager manager = new RegionManager();
+        final ProtectedCuboidRegion first = cuboid("Spawn", 0, 0, 32, 32);
+        manager.addRegion(first);
+        assertSame(first, manager.getRegion("Spawn"));
+
+        final ProtectedCuboidRegion second = cuboid("SPAWN", 0, 0, 32, 32);
+        manager.addRegion(second);
+        assertSame(second, manager.getRegion("Spawn"));
+        assertSame(second, manager.getRegion("SPAWN"));
+
+        manager.removeRegion("spawn");
+        assertNull(manager.getRegion("Spawn"));
+        assertNull(manager.getRegion("SPAWN"));
+    }
+
+    @Test
+    void aFlagSetAfterTheIndexWasBuiltIsSeen() {
+        final RegionManager manager = new RegionManager();
+        final ProtectedCuboidRegion plot = cuboid("plot", 0, 0, 32, 32);
+        manager.addRegion(plot);
+        assertFalse(manager.anyRegionUses(Flags.PVP));
+
+        plot.setFlag(Flags.PVP, State.DENY);
+
+        assertTrue(manager.anyRegionUses(Flags.PVP));
+        assertEquals(State.DENY, manager.getApplicableRegions(16, 64, 16).queryState(Flags.PVP));
+    }
+
+    @Test
+    void groupQualifiedValuesAreSkippedForSubjectsOutsideTheGroup() {
+        final RegionManager manager = new RegionManager();
+        final ProtectedCuboidRegion low = cuboid("low", 0, 0, 32, 32);
+        low.setFlag(Flags.GREETING, "everyone");
+        final ProtectedCuboidRegion high = cuboid("high", 0, 0, 32, 32);
+        high.setPriority(10);
+        high.setFlag(Flags.GREETING, "owners only");
+        high.setFlagGroup(Flags.GREETING, RegionGroup.OWNERS);
+        manager.addRegion(low);
+        manager.addRegion(high);
+
+        final ApplicableRegionSet set = manager.getApplicableRegions(16, 64, 16);
+
+        assertEquals("everyone", set.queryValue(Flags.GREETING, null));
+        assertEquals("owners only", set.queryValue(Flags.GREETING), "the subject-less form is unchanged");
+    }
+
+    @Test
     void intersectingRegionsAreFoundByBoundingBox() {
         final RegionManager manager = new RegionManager();
         manager.addRegion(cuboid("a", 0, 0, 32, 32));
@@ -372,5 +591,43 @@ class RegionEngineTest {
         assertTrue(manager.getRegionsIntersecting(
                 BlockVector3.at(60, 64, 60), BlockVector3.at(90, 64, 90)).isEmpty(),
             "the global region is never an intersection hit");
+    }
+
+    @Test
+    void smallBoxesReadTheChunkCacheWithTheScansAnswer() {
+        final RegionManager manager = new RegionManager();
+        manager.addRegion(cuboid("wide", -40, -40, 40, 40));
+        manager.addRegion(cuboid("east", 10, 0, 20, 8));
+        manager.addRegion(new ProtectedCuboidRegion("sky", BlockVector3.at(0, 200, 0), BlockVector3.at(16, 255, 8)));
+        manager.getRegion("east").setPriority(5);
+
+        final List<ProtectedRegion> straddling = manager.getRegionsIntersecting(
+            BlockVector3.at(12, 64, -4), BlockVector3.at(20, 66, 4));
+        assertEquals(List.of(manager.getRegion("east"), manager.getRegion("wide")), straddling,
+            "a region over all four chunks is reported once, by priority, and the Y bound excludes sky");
+
+        final List<ProtectedRegion> scanned = manager.getRegionsIntersecting(
+            BlockVector3.at(-30, 64, -4), BlockVector3.at(30, 66, 4));
+        assertEquals(List.of(manager.getRegion("east"), manager.getRegion("wide")), scanned,
+            "a box wider than four chunks scans and agrees");
+    }
+
+    @Test
+    void aParentSetStraightOnTheRegionReachesSetsAlreadyShared() {
+        final RegionManager manager = new RegionManager();
+        final ProtectedRegion allow = cuboid("allow", 1000, 1000, 1010, 1010);
+        allow.setFlag(Flags.PVP, State.ALLOW);
+        final ProtectedRegion deny = cuboid("deny", 2000, 2000, 2010, 2010);
+        deny.setFlag(Flags.PVP, State.DENY);
+        final ProtectedRegion child = cuboid("child", 0, 0, 15, 15);
+        child.setParent(allow);
+        manager.addRegion(allow);
+        manager.addRegion(deny);
+        manager.addRegion(child);
+        assertEquals(State.ALLOW, manager.getApplicableRegions(5, 64, 5).queryState(Flags.PVP));
+
+        child.setParent(deny);
+
+        assertEquals(State.DENY, manager.getApplicableRegions(5, 64, 5).queryState(Flags.PVP));
     }
 }

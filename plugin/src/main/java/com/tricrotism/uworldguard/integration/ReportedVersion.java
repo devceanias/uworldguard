@@ -16,18 +16,16 @@ import java.util.logging.Logger;
  * BetonQuest's "WorldGuard 7.0.0 or above" fails against a 1.x plugin even though the API it wants
  * is fully present. PvPManager is worse than a declined hook: it falls through to a legacy hook whose
  * class it no longer ships, and reports only that a hook failed to load. So the API level is
- * published by default. There is one version field per plugin and no way to answer one caller
- * differently from another, so this is all-or-nothing; {@code none} turns it off.
+ * published by default, and {@code none} turns it off.
  *
- * <p>Reflective by necessity: {@code getDescription()} and {@code getPluginMeta()} are final. Both
- * are rewritten because consumers read either one. A failure here is reported rather than swallowed:
- * the operator asked for a specific version to be published, and silently publishing a different one
- * would send them hunting through the wrong plugin.
+ * <p>Only the legacy {@code getDescription()} is rewritten, which is what BetonQuest and PvPManager
+ * read. {@code getPluginMeta()} keeps the real version, so spark's plugin list shows what is installed.
+ *
+ * <p>Reflective because {@code getDescription()} is final. A failure is logged, since silently
+ * publishing a different version than the operator asked for would send them to the wrong plugin.
  */
 @NullMarked
 public final class ReportedVersion {
-
-    private static volatile String real = "";
 
     private ReportedVersion() {}
 
@@ -37,8 +35,7 @@ public final class ReportedVersion {
      * being told about uWorldGuard. That covers its own log lines, its update check and bStats.
      */
     public static String real(final org.bukkit.plugin.Plugin plugin) {
-        final String captured = real;
-        return captured.isEmpty() ? plugin.getPluginMeta().getVersion() : captured;
+        return plugin.getPluginMeta().getVersion();
     }
 
     /**
@@ -54,18 +51,15 @@ public final class ReportedVersion {
         }
         final String version = trimmed.isEmpty() ? WorldGuardApiLevel.VERSION : trimmed;
         final String actual = plugin.getPluginMeta().getVersion();
-        rewrite(plugin.getPluginMeta(), version);
         rewrite(plugin.getDescription(), version);
-        if (!version.equals(plugin.getPluginMeta().getVersion())
-            || !version.equals(plugin.getDescription().getVersion())) {
+        if (!version.equals(plugin.getDescription().getVersion())) {
             log.warning("compatibility.report-version is set to '" + version + "', but this server's"
                 + " plugin metadata could not be rewritten, plugins still see " + actual + "."
                 + " Report this with your Paper version.");
             return;
         }
-        real = actual;
         log.info("Reporting version " + version + " to other plugins (real version: " + actual
-            + "). This is compatibility.report-version. /version reports it too.");
+            + "). This is compatibility.report-version. spark still shows the real version.");
     }
 
     /**

@@ -3,6 +3,7 @@ package com.tricrotism.uworldguard.listeners;
 import com.tricrotism.uworldguard.config.Bypass;
 import com.tricrotism.uworldguard.config.EventGate;
 import com.tricrotism.uworldguard.flags.Flags;
+import com.tricrotism.uworldguard.flags.StateFlag;
 import com.tricrotism.uworldguard.region.ApplicableRegionSet;
 import com.tricrotism.uworldguard.region.ProtectedRegion;
 import com.tricrotism.uworldguard.region.RegionQuery;
@@ -19,23 +20,35 @@ import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
 import org.bukkit.event.entity.EntityDamageEvent;
+import org.bukkit.event.entity.EntityPotionEffectEvent;
 import org.bukkit.event.entity.EntityRegainHealthEvent;
 import org.bukkit.event.entity.EntityRegainHealthEvent.RegainReason;
 import org.bukkit.event.entity.FoodLevelChangeEvent;
 import org.bukkit.event.player.*;
 import org.bukkit.event.vehicle.VehicleEnterEvent;
 import org.bukkit.inventory.EquipmentSlot;
+import org.bukkit.potion.PotionEffect;
+import org.bukkit.potion.PotionEffectType;
 import org.jspecify.annotations.NullMarked;
 
+import java.util.EnumSet;
+import java.util.Set;
 import java.util.UUID;
 
 /**
  * Enforces sleep, enderpearl/chorus teleport, chest-access, respawn-anchors, ride,
- * invincible/godmode, fall-damage, natural-health-regen, natural-hunger-drain, and item-durability.
+ * invincible/godmode, fall-damage, natural-health-regen, natural-hunger-drain, blocked-effects, and
+ * item-durability.
  */
 @NullMarked
 public final class PlayerStateListener implements Listener {
 
+    /**
+     * Every block whose state is a {@link Container}, so chest-access is decided from the type alone
+     * without building a block state. Built from the {@code Container} subtypes: barrel, brewing stand, chest,
+     * crafter, dispenser, dropper, the furnaces, hopper and shulker box. Copper chests are chests.
+     */
+    private static final Set<Material> CONTAINERS = containers();
 
     private final RegionQuery query;
     private final MessageService messages;
@@ -43,6 +56,19 @@ public final class PlayerStateListener implements Listener {
     public PlayerStateListener(final RegionQuery query, final MessageService messages) {
         this.query = query;
         this.messages = messages;
+    }
+
+    private static Set<Material> containers() {
+        final EnumSet<Material> set = EnumSet.of(Material.CHEST, Material.TRAPPED_CHEST, Material.BARREL,
+            Material.BREWING_STAND, Material.CRAFTER, Material.DISPENSER, Material.DROPPER,
+            Material.FURNACE, Material.BLAST_FURNACE, Material.SMOKER, Material.HOPPER);
+        for (final Material material : Material.values()) {
+            final String name = material.name();
+            if (!material.isLegacy() && (name.endsWith("SHULKER_BOX") || name.endsWith("COPPER_CHEST"))) {
+                set.add(material);
+            }
+        }
+        return set;
     }
 
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
@@ -66,13 +92,13 @@ public final class PlayerStateListener implements Listener {
         if (event.getTo() == null) {
             return;
         }
+        // Note: since 1.21.4 chorus fruit teleports as a consume effect, and CHORUS_FRUIT is never sent
         final var flag = switch (event.getCause().name()) {
             case "ENDER_PEARL" -> Flags.ENDERPEARL;
-            case "CHORUS_FRUIT" -> Flags.CHORUS_TELEPORT;
+            case "CHORUS_FRUIT", "CONSUMABLE_EFFECT" -> Flags.CHORUS_TELEPORT;
             default -> null;
         };
-        if (flag != null && !query.testState(event.getTo(), flag)
-            && !Bypass.has(event.getPlayer())) {
+        if (flag != null && teleportRefused(event, flag)) {
             event.setCancelled(true);
             return;
         }
@@ -82,6 +108,27 @@ public final class PlayerStateListener implements Listener {
             return;
         }
         checkExitViaTeleport(event);
+    }
+
+    /**
+     * As in WorldGuard, the flag is tested for the player both where the pearl or fruit was used and
+     * where it lands. So a deny also stops someone throwing their way out, and a {@code -g} group applies.
+     */
+    private boolean teleportRefused(final PlayerTeleportEvent event, final StateFlag flag) {
+        final Player player = event.getPlayer();
+        final UUID id = player.getUniqueId();
+        ApplicableRegionSet set = query.getApplicableRegions(event.getFrom());
+        if (set.testState(flag, id)) {
+            set = query.getApplicableRegions(event.getTo());
+            if (set.testState(flag, id)) {
+                return false;
+            }
+        }
+        if (Bypass.has(player)) {
+            return false;
+        }
+        messages.sendRegionDeny(player, flag, set);
+        return true;
     }
 
     /**
@@ -107,6 +154,9 @@ public final class PlayerStateListener implements Listener {
     private void checkExitViaTeleport(final PlayerTeleportEvent event) {
         final Location to = event.getTo();
         if (to == null) {
+            return;
+        }
+        if (!query.usesFlag(event.getFrom().getWorld(), Flags.EXIT_VIA_TELEPORT)) {
             return;
         }
         final Player player = event.getPlayer();
@@ -170,24 +220,26 @@ public final class PlayerStateListener implements Listener {
             return;
         }
         final Player player = event.getPlayer();
-        if (block.getType() == Material.RESPAWN_ANCHOR) {
+        final Material type = block.getType();
+        if (type == Material.RESPAWN_ANCHOR) {
             final ApplicableRegionSet anchorSet = query.getApplicableRegions(block);
-            if (!anchorSet.testBuild(player.getUniqueId(), Flags.RESPAWN_ANCHORS) && !Bypass.has(player)) {
+            if (!anchorSet.testBuild(player.getUniqueId(), Flags.RESPAWN_ANCHORS) && !Bypass.has(player)
+                && !anchorSet.flagSetContains(Flags.ALLOW_INTERACT, Material.RESPAWN_ANCHOR)) {
                 event.setCancelled(true);
-                messages.sendDeny(player, Flags.RESPAWN_ANCHORS, anchorSet.queryValue(Flags.DENY_MESSAGE));
+                messages.sendRegionDeny(player, Flags.RESPAWN_ANCHORS, anchorSet);
             }
             return;
         }
-        if (!(block.getState(false) instanceof Container)) {
+        if (!CONTAINERS.contains(type)) {
             return;
         }
         final ApplicableRegionSet set = query.getApplicableRegions(block);
         if (!set.testBuild(player.getUniqueId(), Flags.CHEST_ACCESS)) {
-            if (Bypass.has(player)) {
+            if (Bypass.has(player) || set.flagSetContains(Flags.ALLOW_INTERACT, type)) {
                 return;
             }
             event.setCancelled(true);
-            messages.sendDeny(player, Flags.CHEST_ACCESS, set.queryValue(Flags.DENY_MESSAGE));
+            messages.sendRegionDeny(player, Flags.CHEST_ACCESS, set);
         }
     }
 
@@ -259,7 +311,8 @@ public final class PlayerStateListener implements Listener {
         final World world = player.getWorld();
         final boolean invincibility =
             query.usesFlag(world, Flags.INVINCIBLE) || query.usesFlag(world, Flags.GODMODE);
-        final boolean fall = event.getCause() == EntityDamageEvent.DamageCause.FALL
+        final boolean fall = (event.getCause() == EntityDamageEvent.DamageCause.FALL
+            || event.getCause() == EntityDamageEvent.DamageCause.FLY_INTO_WALL)
             && query.usesFlag(world, Flags.FALL_DAMAGE);
         if (!invincibility && !fall) {
             return;
@@ -272,6 +325,33 @@ public final class PlayerStateListener implements Listener {
         }
         if (fall && !set.testState(Flags.FALL_DAMAGE, player.getUniqueId())) {
             event.setCancelled(true);
+        }
+    }
+
+    /**
+     * Refuses a blocked effect as it is applied. The tick service strips blocked effects once a
+     * second, which is too slow for a wither rose: it re-applies Wither every tick the player stands
+     * in it, so damage lands between strips. The tick still clears effects a player walks in with.
+     */
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    public void onEffect(final EntityPotionEffectEvent event) {
+        if (!(event.getEntity() instanceof Player player) || event.getNewEffect() == null
+            || EventGate.disabled(event)) {
+            return;
+        }
+        if (!query.usesFlag(player.getWorld(), Flags.BLOCKED_EFFECTS)) {
+            return;
+        }
+        final Set<PotionEffect> blocked = query.queryValue(player, Flags.BLOCKED_EFFECTS);
+        if (blocked == null) {
+            return;
+        }
+        final PotionEffectType type = event.getModifiedType();
+        for (final PotionEffect effect : blocked) {
+            if (effect.getType() == type) {
+                event.setCancelled(true);
+                return;
+            }
         }
     }
 

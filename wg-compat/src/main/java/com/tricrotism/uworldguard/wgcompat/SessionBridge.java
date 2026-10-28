@@ -25,8 +25,8 @@ import java.util.logging.Logger;
  * dispatch seam. Until then {@link SessionDispatch#ACTIVE} is false and the movement path costs one
  * boolean read.
  */
-public final class SessionBridge implements com.sk89q.worldguard.session.SessionManager,
-    SessionDispatch.Sink {
+public final class SessionBridge extends com.sk89q.worldguard.bukkit.session.BukkitSessionManager
+    implements SessionDispatch.Sink {
 
     public static final SessionBridge INSTANCE = new SessionBridge();
 
@@ -147,6 +147,19 @@ public final class SessionBridge implements com.sk89q.worldguard.session.Session
         return removed;
     }
 
+    /**
+     * Whether a handler factory whose class came from {@code loader} is registered.
+     */
+    public boolean hasHandlersOwnedBy(final ClassLoader loader) {
+        for (final com.sk89q.worldguard.session.handler.Handler.Factory<
+            ? extends com.sk89q.worldguard.session.handler.Handler> factory : factories) {
+            if (factory.getClass().getClassLoader() == loader) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     @Override
     public boolean customHandlersRegistered() {
         return !factories.isEmpty();
@@ -203,6 +216,9 @@ public final class SessionBridge implements com.sk89q.worldguard.session.Session
      * threading no API reaches into another region synchronously, and a task scheduled there never
      * runs, because the plugin's tasks are cancelled with it. What that leaves unreverted is the same
      * remainder {@code MovementListener.shutdown} leaves, and for the same reason.
+     *
+     * <p>The factories stay. Consumers register once and never again, so {@link #rearm} needs them to
+     * resume dispatch after an in-place disable and enable.
      */
     @Override
     public void shutdown() {
@@ -217,7 +233,6 @@ public final class SessionBridge implements com.sk89q.worldguard.session.Session
                     (com.sk89q.worldguard.LocalPlayer) PlayerWrapping.wrap(bukkit));
             }
         }
-        factories.clear();
     }
 
     /**
@@ -228,9 +243,33 @@ public final class SessionBridge implements com.sk89q.worldguard.session.Session
      * consumer that registered before an in-place disable and enable therefore had a manager that
      * still listed its factories and still answered {@code customHandlersRegistered()}, while every
      * movement gate read false and its handlers were never dispatched again.
+     *
+     * <p>Factories of plugins that disabled while uWorldGuard was down are dropped first: the
+     * disable listener that normally releases them was not running, and dispatching into a closed
+     * classloader is exactly what {@link #releaseHandlersOwnedBy} exists to prevent.
      */
     static void rearm() {
-        SessionDispatch.ACTIVE = !INSTANCE.factories.isEmpty() && WgCompatBridge.active();
+        INSTANCE.factories.removeIf(SessionBridge::ownerDisabled);
+        if (INSTANCE.factories.isEmpty()) {
+            return;
+        }
+        SessionDispatch.install(INSTANCE);
+        SessionDispatch.ACTIVE = WgCompatBridge.active();
+    }
+
+    /**
+     * Whether {@code factory} came from a plugin that is no longer enabled. A factory loaded by
+     * anything other than a plugin classloader, a shared library for example, is kept.
+     */
+    private static boolean ownerDisabled(
+        final com.sk89q.worldguard.session.handler.Handler.Factory<
+            ? extends com.sk89q.worldguard.session.handler.Handler> factory) {
+        if (!(factory.getClass().getClassLoader()
+            instanceof io.papermc.paper.plugin.provider.classloader.ConfiguredPluginClassLoader loader)) {
+            return false;
+        }
+        final org.bukkit.plugin.java.JavaPlugin owner = loader.getPlugin();
+        return owner == null || !owner.isEnabled();
     }
 
     @Override
@@ -240,12 +279,60 @@ public final class SessionBridge implements com.sk89q.worldguard.session.Session
         final org.bukkit.@NonNull Location to,
         final SessionDispatch.@NonNull Move type
     ) {
+        final com.sk89q.worldguard.LocalPlayer local = (com.sk89q.worldguard.LocalPlayer) PlayerWrapping.wrap(player);
+        final com.sk89q.worldedit.util.Location denied = get(local).uwgTestMoveTo(local, adapt(from), adapt(to), moveType(type));
+        return denied == null ? null : com.sk89q.worldedit.bukkit.BukkitAdapter.adapt(denied);
+    }
+
+    private record AdaptedWorld(java.lang.ref.WeakReference<org.bukkit.World> bukkit,
+                                com.sk89q.worldedit.world.World world) {}
+
+    private static final ConcurrentHashMap<UUID, AdaptedWorld> ADAPTED = new ConcurrentHashMap<>();
+
+    /**
+     * WorldEdit builds a new {@code BukkitWorld} on every adapt, so one per world is kept instead. Both
+     * sides hold the Bukkit world weakly, so an unloaded world is not pinned, and a world loaded again
+     * under the same UID gets a fresh one.
+     */
+    private static com.sk89q.worldedit.util.Location adapt(final org.bukkit.@NonNull Location location) {
+        final org.bukkit.World bukkit = location.getWorld();
+        final UUID id = bukkit.getUID();
+        final AdaptedWorld cached = ADAPTED.get(id);
+        com.sk89q.worldedit.world.World world;
+        if (cached != null && cached.bukkit().get() == bukkit) {
+            world = cached.world();
+        } else {
+            world = com.sk89q.worldedit.bukkit.BukkitAdapter.adapt(bukkit);
+            ADAPTED.put(id, new AdaptedWorld(new java.lang.ref.WeakReference<>(bukkit), world));
+        }
+        return new com.sk89q.worldedit.util.Location(world, location.getX(), location.getY(), location.getZ(),
+            location.getYaw(), location.getPitch());
+    }
+
+    @Override
+    public org.bukkit.Location testMove(
+        final org.bukkit.entity.@NonNull Player player,
+        final org.bukkit.@NonNull Location from,
+        final org.bukkit.@NonNull Location to,
+        final SessionDispatch.@NonNull Move type,
+        final com.tricrotism.uworldguard.region.@NonNull ApplicableRegionSet fromSet,
+        final com.tricrotism.uworldguard.region.@NonNull ApplicableRegionSet toSet
+    ) {
+        if (!com.sk89q.worldguard.session.Session.uwgAnyTestsMoves()
+            && com.sk89q.worldguard.session.Session.uwgSameRegions(fromSet, toSet)) {
+            return null;
+        }
+        final com.tricrotism.uworldguard.region.RegionManager fromWorld = WgCompatBridge.container().get(from.getWorld());
+        final com.tricrotism.uworldguard.region.RegionManager toWorld = WgCompatBridge.container().get(to.getWorld());
+        if (fromWorld == null || toWorld == null) {
+            return testMove(player, from, to, type);
+        }
         final com.sk89q.worldguard.LocalPlayer local =
             (com.sk89q.worldguard.LocalPlayer) PlayerWrapping.wrap(player);
         final com.sk89q.worldedit.util.Location denied = get(local).uwgTestMoveTo(local,
-            com.sk89q.worldedit.bukkit.BukkitAdapter.adapt(from),
-            com.sk89q.worldedit.bukkit.BukkitAdapter.adapt(to),
-            moveType(type));
+            adapt(from), adapt(to), moveType(type),
+            WrappedRegionSet.of(fromSet, fromWorld),
+            WrappedRegionSet.of(toSet, toWorld));
         return denied == null ? null : com.sk89q.worldedit.bukkit.BukkitAdapter.adapt(denied);
     }
 
@@ -261,11 +348,21 @@ public final class SessionBridge implements com.sk89q.worldguard.session.Session
         };
     }
 
+    /**
+     * The region set comes straight from the Bukkit player, as WorldEdit's {@code getLocation} builds a
+     * new world wrapper on every call.
+     */
     @Override
     public void tick(final org.bukkit.entity.@NonNull Player player) {
         final com.sk89q.worldguard.LocalPlayer local =
             (com.sk89q.worldguard.LocalPlayer) PlayerWrapping.wrap(player);
-        get(local).tick(local);
+        final com.sk89q.worldguard.session.Session session = get(local);
+        if (!session.uwgTicks()) {
+            return;
+        }
+        session.uwgTick(local, com.sk89q.worldguard.protection.regions.RegionQuery.uwgApplicableRegions(
+            player.getWorld(), org.bukkit.Location.locToBlock(player.getX()),
+            org.bukkit.Location.locToBlock(player.getY()), org.bukkit.Location.locToBlock(player.getZ())));
     }
 
     /**

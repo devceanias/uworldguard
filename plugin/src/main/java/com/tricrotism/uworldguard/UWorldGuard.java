@@ -1,12 +1,13 @@
 package com.tricrotism.uworldguard;
 
+import com.tricrotism.uworldguard.blacklist.BlacklistService;
+import com.tricrotism.uworldguard.commands.BlacklistCommands;
 import com.tricrotism.uworldguard.commands.CompatCommands;
 import com.tricrotism.uworldguard.commands.RegionCommands;
 import com.tricrotism.uworldguard.config.*;
 import com.tricrotism.uworldguard.gui.ChatInputListener;
 import com.tricrotism.uworldguard.gui.ChatInputService;
-import com.tricrotism.uworldguard.integration.BStats;
-import com.tricrotism.uworldguard.integration.ReportedVersion;
+import com.tricrotism.uworldguard.integration.*;
 import com.tricrotism.uworldguard.listeners.*;
 import com.tricrotism.uworldguard.migration.MigrationCommands;
 import com.tricrotism.uworldguard.packet.PacketHooks;
@@ -51,11 +52,13 @@ public final class UWorldGuard extends com.sk89q.worldguard.bukkit.WorldGuardPlu
     private @Nullable RegionStore store;
     private @Nullable MetricsBase metrics;
     private volatile @Nullable ScheduledTask autoSaveTask;
+    private long autoSavePeriod;
     private volatile @Nullable ScheduledTask messageExpiryTask;
     private @Nullable FlagLifecycle flagLifecycle;
     private @Nullable PlayerTickService playerTick;
     private @Nullable ChunkUnloadService chunkUnload;
     private @Nullable PendingRestores restores;
+    private @Nullable BlacklistService blacklist;
 
     /**
      * Re-reads {@code config.yml} and applies everything that can change at runtime. Movement mode
@@ -71,6 +74,10 @@ public final class UWorldGuard extends com.sk89q.worldguard.bukkit.WorldGuardPlu
         }
         EventGate.load(getConfig(), getLogger());
         InteractionWhitelist.load(getConfig(), getLogger());
+        final BlacklistService list = this.blacklist;
+        if (list != null) {
+            list.load(getConfig(), getLogger());
+        }
         Messages.expire();
         final MovementListener listener = this.movement;
         if (listener != null && current != null) {
@@ -85,20 +92,34 @@ public final class UWorldGuard extends com.sk89q.worldguard.bukkit.WorldGuardPlu
      * (Re)starts the autosave at the configured cadence, cancelling any task already running. Reading
      * the period once at enable and dropping the handle meant a reload could neither retune it nor
      * start one that had been configured off at boot.
+     *
+     * <p>A running task with the same period is kept, since re-arming it would push the next save out
+     * by a full period on every reload.
+     *
+     * <p>Synchronized with {@link #cancelAutoSave}: two overlapping {@code /uwg reload}s could each
+     * cancel the same old task and each assign a new one, orphaning the first.
      */
-    private void scheduleAutoSave(final Settings settings) {
-        final ScheduledTask running = this.autoSaveTask;
-        if (running != null) {
-            running.cancel();
-            this.autoSaveTask = null;
-        }
-        final RegionContainerImpl regionContainer = this.container;
+    private synchronized void scheduleAutoSave(final Settings settings) {
         final long period = settings.autoSaveMinutes();
+        if (autoSaveTask != null && period == autoSavePeriod) {
+            return;
+        }
+        cancelAutoSave();
+        final RegionContainerImpl regionContainer = this.container;
         if (period <= 0L || regionContainer == null) {
             return;
         }
         this.autoSaveTask = getServer().getAsyncScheduler().runAtFixedRate(this,
             _ -> regionContainer.saveAll(), period, period, TimeUnit.MINUTES);
+        this.autoSavePeriod = period;
+    }
+
+    private synchronized void cancelAutoSave() {
+        final ScheduledTask running = this.autoSaveTask;
+        if (running != null) {
+            running.cancel();
+            this.autoSaveTask = null;
+        }
     }
 
     /**
@@ -136,9 +157,14 @@ public final class UWorldGuard extends com.sk89q.worldguard.bukkit.WorldGuardPlu
         }
         EventGate.load(getConfig(), getLogger());
         InteractionWhitelist.load(getConfig(), getLogger());
+        final boolean swapped = HotSwap.reclaimProvidedNames(this, getLogger());
         final boolean worldGuardCompat = prepareWorldGuardCompat();
 
         final RegionStore store = createStore(settings);
+        if (store == null) {
+            getServer().getPluginManager().disablePlugin(this);
+            return;
+        }
         this.store = store;
 
         final RegionContainerImpl regionContainer = new RegionContainerImpl(this, store);
@@ -165,6 +191,10 @@ public final class UWorldGuard extends com.sk89q.worldguard.bukkit.WorldGuardPlu
         final ChamberedPearlTracker pearls = new ChamberedPearlTracker(this);
         final ChatInputService chatInput = new ChatInputService();
         final ChatTags chatTags = new ChatTags();
+        final BlacklistService blacklist = new BlacklistService(this, messages);
+        blacklist.load(getConfig(), getLogger());
+        blacklist.start();
+        this.blacklist = blacklist;
 
         final PendingRestores restores = new PendingRestores(this);
         this.restores = restores;
@@ -172,6 +202,7 @@ public final class UWorldGuard extends com.sk89q.worldguard.bukkit.WorldGuardPlu
 
         activatePackets();
         getServer().getPluginManager().registerEvents(new BuildProtectionListener(query, messages), this);
+        getServer().getPluginManager().registerEvents(new PlacedBlocks(this, query, messages), this);
         final MovementListener movement =
             new MovementListener(this, query, messages, collision, pearls, chatTags, restores, settings);
         this.movement = movement;
@@ -179,12 +210,17 @@ public final class UWorldGuard extends com.sk89q.worldguard.bukkit.WorldGuardPlu
         getServer().getPluginManager().registerEvents(new NaturalListener(query), this);
         getServer().getPluginManager().registerEvents(new CropTrampleListener(query), this);
         getServer().getPluginManager().registerEvents(new EntityListener(regionContainer, query), this);
-        getServer().getPluginManager().registerEvents(new PlayerStateListener(query, messages), this);
+        final PlayerStateListener playerState = new PlayerStateListener(query, messages);
+        getServer().getPluginManager().registerEvents(playerState, this);
         getServer().getPluginManager().registerEvents(new ItemUseListener(regionContainer, query, messages), this);
         getServer().getPluginManager().registerEvents(new EndCrystalListener(query, messages), this);
-        getServer().getPluginManager().registerEvents(new WorkbenchListener(query, messages), this);
+        getServer().getPluginManager().registerEvents(new WorkbenchListener(regionContainer, query, messages), this);
         getServer().getPluginManager().registerEvents(new DeathListener(query, messages), this);
-        getServer().getPluginManager().registerEvents(new TravelListener(query), this);
+        final TravelListener travel = new TravelListener(query);
+        getServer().getPluginManager().registerEvents(travel, this);
+        if (!CanvasTeleports.register(this, playerState, movement, travel)) {
+            FoliaTeleports.register(this, playerState, movement, travel);
+        }
         getServer().getPluginManager().registerEvents(new PearlListener(regionContainer, pearls), this);
         getServer().getPluginManager().registerEvents(new ChatInputListener(this, chatInput), this);
         final ChunkUnloadService chunkUnload = new ChunkUnloadService(this, regionContainer);
@@ -198,12 +234,14 @@ public final class UWorldGuard extends com.sk89q.worldguard.bukkit.WorldGuardPlu
         getServer().getPluginManager().registerEvents(new VehicleListener(query, messages), this);
         getServer().getPluginManager().registerEvents(new InteractionListener(query, messages), this);
         getServer().getPluginManager().registerEvents(new MachineListener(regionContainer, query, messages), this);
+        getServer().getPluginManager().registerEvents(new BlacklistListener(blacklist), this);
         if (wand != null) {
             getServer().getPluginManager().registerEvents(wand, this);
         }
 
         new RegionCommands(this, regionContainer, selection, chatInput, messages)
-            .register(new MigrationCommands(this, regionContainer), new CompatCommands());
+            .register(new MigrationCommands(this, regionContainer), new CompatCommands(),
+                new BlacklistCommands(this, blacklist));
 
         movement.start();
         movement.replayOnlineRestores();
@@ -229,6 +267,7 @@ public final class UWorldGuard extends com.sk89q.worldguard.bukkit.WorldGuardPlu
 
         // bStats | https://bstats.org/plugin/bukkit/uWorldGuard/32190
         this.metrics = BStats.start(this, 32190);
+        HotSwap.reloadDependents(this, swapped, getLogger());
     }
 
     /**
@@ -252,11 +291,11 @@ public final class UWorldGuard extends com.sk89q.worldguard.bukkit.WorldGuardPlu
      */
     private boolean prepareWorldGuardCompat() {
         final Plugin claimant = getServer().getPluginManager().getPlugin("WorldGuard");
-        if (claimant != null && claimant != this) {
+        if (claimant != null && claimant != this && !HotSwap.isStaleCopy(claimant, this)) {
             WgCompatBridge.markInactive("another plugin provides WorldGuard ("
                 + claimant.getName() + " " + claimant.getPluginMeta().getVersion() + ")");
             getLogger().severe("WorldGuard is installed alongside uWorldGuard. The WorldGuard API"
-                + " compatibility layer is disabled — remove one of the two plugins.");
+                + " compatibility layer is disabled, remove one of the two plugins.");
             return false;
         }
         if (getServer().getPluginManager().getPlugin("WorldEdit") == null) {
@@ -277,7 +316,7 @@ public final class UWorldGuard extends com.sk89q.worldguard.bukkit.WorldGuardPlu
         WgCompatBridge.bind(regionContainer, this);
         WgCompatBridge.bypassCheck(Bypass::has);
         getLogger().info("WorldGuard API compatibility layer active (emulating the WorldGuard 7 API"
-            + " — this is uWorldGuard " + ReportedVersion.real(this)
+            + ", this is uWorldGuard " + ReportedVersion.real(this)
             + ", not EngineHub WorldGuard).");
     }
 
@@ -297,16 +336,69 @@ public final class UWorldGuard extends com.sk89q.worldguard.bukkit.WorldGuardPlu
         }
     }
 
-    private RegionStore createStore(final Settings settings) {
+    private @Nullable RegionStore createStore(final Settings settings) {
+        final RegionStore configured = createConfiguredStore(settings);
+        if (configured == null) {
+            return null;
+        }
+        final RegionStore universe = createUniverseStore(configured);
+        return universe != null ? universe : configured;
+    }
+
+    /**
+     * The backend {@code config.yml} selects, or null when SQL is selected and cannot be opened.
+     * Falling back to YAML there enforced an empty or stale copy of the regions and split every
+     * later edit between two stores, so the caller refuses to enable instead.
+     */
+    private @Nullable RegionStore createConfiguredStore(final Settings settings) {
+        if (settings.storageSettingsDisagree()) {
+            getLogger().warning("storage.type is '" + settings.storageType() + "' but storage.sql.enabled"
+                + " does not match it. SQL storage is only used when both select it, so regions are"
+                + " stored in YAML.");
+        }
         if (settings.isSqlEnabled()) {
             try {
                 getLogger().info("Using SQL storage backend.");
                 return new SqlRegionStore(settings.sqlUrl(), settings.sqlUser(), settings.sqlPassword());
             } catch (final Exception e) {
-                getLogger().log(Level.WARNING, "Failed to initialise SQL storage; falling back to YAML.", e);
+                getLogger().log(Level.SEVERE, "Failed to initialise SQL storage. uWorldGuard is disabling"
+                    + " itself rather than run without its regions. Fix storage.sql and restart.", e);
+                return null;
             }
         }
         return new YamlRegionStore(getDataFolder());
+    }
+
+    /**
+     * On UniverseSpigot, regions live in the server's own region service, with {@code configured} kept
+     * as the store each world migrates from on its first load there. Reflection keeps every uSpigot
+     * type out of this class, so on Paper nothing from the {@code universe} source set is ever loaded.
+     */
+    private @Nullable RegionStore createUniverseStore(final RegionStore configured) {
+        if (getClassLoader().getResource("com/universeprojects/Universe.class") == null) {
+            return null;
+        }
+        final Object service;
+        try {
+            service = Class.forName("com.universeprojects.Universe").getMethod("regions").invoke(null);
+        } catch (final ReflectiveOperationException | LinkageError e) {
+            getLogger().log(Level.WARNING, "UniverseSpigot detected but its region service could not be reached. Using the configured storage instead.", e);
+            return null;
+        }
+        if (service == null) {
+            getLogger().warning("UniverseSpigot detected but it has no region service. Using the configured storage instead.");
+            return null;
+        }
+        try {
+            final RegionStore store = (RegionStore) Class.forName("com.tricrotism.uworldguard.universe.UniverseRegionStore")
+                .getMethod("create", Plugin.class, Object.class, RegionStore.class)
+                .invoke(null, this, service, configured);
+            getLogger().info("UniverseSpigot detected. Regions are stored and indexed by its region service.");
+            return store;
+        } catch (final ReflectiveOperationException | LinkageError e) {
+            getLogger().log(Level.WARNING, "UniverseSpigot detected but its region API does not match the one this build expects. Using the configured storage instead.", e);
+            return null;
+        }
     }
 
     /**
@@ -324,13 +416,32 @@ public final class UWorldGuard extends com.sk89q.worldguard.bukkit.WorldGuardPlu
      */
     @Override
     public void onDisable() {
+        if (container != null) {
+            try {
+                HotSwap.disableDependents(this, getLogger());
+            } catch (final RuntimeException | LinkageError e) {
+                getLogger().log(Level.SEVERE, "Error while disabling the plugins that use uWorldGuard.", e);
+            }
+        }
         try {
             releaseRuntime();
         } catch (final RuntimeException | LinkageError e) {
             getLogger().log(Level.SEVERE, "Error while shutting down; saving regions anyway.", e);
         }
-        if (container != null) {
-            container.saveAllBlocking();
+        // Outside releaseRuntime so a throw there cannot skip it. The file is deleted at boot, so a
+        // missed write loses every owed game-mode, speed and flight restore.
+        final PendingRestores owed = this.restores;
+        if (owed != null) {
+            this.restores = null;
+            try {
+                owed.flushNow();
+            } catch (final RuntimeException e) {
+                getLogger().log(Level.SEVERE, "Could not write pending-restores.yml.", e);
+            }
+        }
+        final Settings current = this.settings;
+        if (container != null && current != null) {
+            container.saveAllBlocking(current.unloadSaveWaitSeconds());
         }
         if (store != null) {
             store.close();
@@ -339,11 +450,7 @@ public final class UWorldGuard extends com.sk89q.worldguard.bukkit.WorldGuardPlu
     }
 
     private void releaseRuntime() {
-        final ScheduledTask autoSave = this.autoSaveTask;
-        if (autoSave != null) {
-            autoSave.cancel();
-            this.autoSaveTask = null;
-        }
+        cancelAutoSave();
         final ScheduledTask messageExpiry = this.messageExpiryTask;
         if (messageExpiry != null) {
             messageExpiry.cancel();
@@ -359,7 +466,10 @@ public final class UWorldGuard extends com.sk89q.worldguard.bukkit.WorldGuardPlu
         }
         if (restores != null) {
             restores.stop();
-            restores = null;
+        }
+        if (blacklist != null) {
+            blacklist.stop();
+            blacklist = null;
         }
         if (movement != null) {
             movement.stop();

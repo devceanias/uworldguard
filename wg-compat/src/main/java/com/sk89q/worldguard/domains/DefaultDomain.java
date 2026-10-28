@@ -17,8 +17,8 @@ import java.util.UUID;
  *
  * <p>Wraps a uWorldGuard {@code com.tricrotism.uworldguard.domain.DefaultDomain} in place — there is
  * no domain-swap setter on an engine region, so {@link #setPlayerDomain} and {@link #setGroupDomain}
- * replace the contents rather than the object. When the domain belongs to a region, every mutation
- * marks that region's world dirty.
+ * replace the contents rather than the object. When the domain belongs to a region, every edit that
+ * changes it marks that region's world dirty.
  *
  * <p>The engine stores no names. Name-keyed reads resolve from the server's player cache and omit
  * anything unresolvable; name-keyed writes that cannot resolve are dropped with a one-time warning.
@@ -76,31 +76,39 @@ public class DefaultDomain implements Domain, ChangeTracked {
      * Replaces the players in this domain with those of {@code playerDomain}. The engine domain
      * object itself is never swapped.
      *
-     * <p>The incoming ids are copied before this domain is cleared. WorldGuard swaps a reference
-     * here, so handing back the domain's own {@code PlayerDomain} costs nothing there, and that is
-     * the natural way to write back after editing one. Reading the live view after clearing it made
-     * that same call empty the region's owners instead.
+     * <p>The incoming ids are copied first and only the difference is applied. WorldGuard swaps a
+     * reference here, so handing back the domain's own {@code PlayerDomain} costs nothing there, and
+     * that is the natural way to write back after editing one. Here it changes nothing and marks
+     * nothing, and a player in both domains is never missing in between.
      */
     public void setPlayerDomain(final PlayerDomain playerDomain) {
-        final Set<UUID> incoming = Set.copyOf(playerDomain.getUniqueIds());
-        this.playerDomain.clear();
-        for (final UUID uniqueId : incoming) {
-            backing.addPlayer(uniqueId);
+        if (replacePlayers(Set.copyOf(playerDomain.getUniqueIds()))) {
+            changed();
         }
-        changed();
     }
 
     /**
-     * Replaces the groups in this domain with those of {@code groupDomain}. Copied first, for the
-     * reason {@link #setPlayerDomain} gives.
+     * Replaces the groups in this domain with those of {@code groupDomain}, the way
+     * {@link #setPlayerDomain} replaces players.
      */
     public void setGroupDomain(final GroupDomain groupDomain) {
-        final Set<String> incoming = Set.copyOf(groupDomain.getGroups());
-        this.groupDomain.clear();
-        for (final String group : incoming) {
-            backing.addGroup(group);
+        if (replaceGroups(Set.copyOf(groupDomain.getGroups()))) {
+            changed();
         }
-        changed();
+    }
+
+    /**
+     * Internal: replaces this domain's players and groups with those of {@code other}, which may be
+     * this domain itself. Both are copied before anything changes, and a change is marked once.
+     */
+    public void uwgReplace(final DefaultDomain other) {
+        final Set<UUID> players = Set.copyOf(other.getUniqueIds());
+        final Set<String> groups = Set.copyOf(other.getGroups());
+        final boolean playersChanged = replacePlayers(players);
+        final boolean groupsChanged = replaceGroups(groups);
+        if (playersChanged || groupsChanged) {
+            changed();
+        }
     }
 
     public Set<UUID> getUniqueIds() {
@@ -120,6 +128,9 @@ public class DefaultDomain implements Domain, ChangeTracked {
     }
 
     public void addPlayer(final UUID uniqueId) {
+        if (backing.containsPlayer(uniqueId)) {
+            return;
+        }
         backing.addPlayer(uniqueId);
         changed();
     }
@@ -139,11 +150,17 @@ public class DefaultDomain implements Domain, ChangeTracked {
     }
 
     public void addGroup(final String name) {
+        if (backing.containsGroup(name)) {
+            return;
+        }
         backing.addGroup(name);
         changed();
     }
 
     public void removePlayer(final UUID uuid) {
+        if (!backing.containsPlayer(uuid)) {
+            return;
+        }
         backing.removePlayer(uuid);
         changed();
     }
@@ -156,28 +173,49 @@ public class DefaultDomain implements Domain, ChangeTracked {
     }
 
     public void removeGroup(final String name) {
+        if (!backing.containsGroup(name)) {
+            return;
+        }
         backing.removeGroup(name);
         changed();
     }
 
     public void addAll(final DefaultDomain other) {
+        boolean edited = false;
         for (final UUID uniqueId : other.getUniqueIds()) {
-            backing.addPlayer(uniqueId);
+            if (!backing.containsPlayer(uniqueId)) {
+                backing.addPlayer(uniqueId);
+                edited = true;
+            }
         }
         for (final String group : other.getGroups()) {
-            backing.addGroup(group);
+            if (!backing.containsGroup(group)) {
+                backing.addGroup(group);
+                edited = true;
+            }
         }
-        changed();
+        if (edited) {
+            changed();
+        }
     }
 
     public void removeAll(final DefaultDomain other) {
+        boolean edited = false;
         for (final UUID uniqueId : other.getUniqueIds()) {
-            backing.removePlayer(uniqueId);
+            if (backing.containsPlayer(uniqueId)) {
+                backing.removePlayer(uniqueId);
+                edited = true;
+            }
         }
         for (final String group : other.getGroups()) {
-            backing.removeGroup(group);
+            if (backing.containsGroup(group)) {
+                backing.removeGroup(group);
+                edited = true;
+            }
         }
-        changed();
+        if (edited) {
+            changed();
+        }
     }
 
     public void removeAll() {
@@ -186,6 +224,9 @@ public class DefaultDomain implements Domain, ChangeTracked {
 
     @Override
     public void clear() {
+        if (backing.isEmpty()) {
+            return;
+        }
         for (final UUID uniqueId : backing.getPlayers()) {
             backing.removePlayer(uniqueId);
         }
@@ -252,8 +293,35 @@ public class DefaultDomain implements Domain, ChangeTracked {
         return join(getPlayers(), "");
     }
 
+    /**
+     * As {@link #toPlayersString()}, but a player missing from the server's cache is printed from
+     * {@code cache} when it has them, and as their UUID otherwise.
+     */
+    public String toPlayersString(final com.sk89q.worldguard.util.profile.cache.ProfileCache cache) {
+        final Set<String> names = new LinkedHashSet<>(backing.size());
+        for (final UUID uniqueId : backing.getPlayers()) {
+            String name = com.tricrotism.uworldguard.wgcompat.NameResolver.name(uniqueId);
+            if (name == null && cache != null) {
+                final com.sk89q.worldguard.util.profile.Profile profile = cache.getIfPresent(uniqueId);
+                name = profile == null ? null : profile.getName();
+            }
+            names.add(name == null ? "uuid:" + uniqueId : name);
+        }
+        return join(names, "");
+    }
+
     public String toUserFriendlyString() {
-        final String players = toPlayersString();
+        return friendly(toPlayersString());
+    }
+
+    /**
+     * @see #toPlayersString(com.sk89q.worldguard.util.profile.cache.ProfileCache)
+     */
+    public String toUserFriendlyString(final com.sk89q.worldguard.util.profile.cache.ProfileCache cache) {
+        return friendly(toPlayersString(cache));
+    }
+
+    private String friendly(final String players) {
         final String groups = toGroupsString();
         if (players.isEmpty()) {
             return groups;
@@ -283,6 +351,47 @@ public class DefaultDomain implements Domain, ChangeTracked {
             joiner.add(prefix + value);
         }
         return joiner.toString();
+    }
+
+    /**
+     * Removes the players missing from {@code incoming}, then adds the new ones. Returns whether the
+     * engine domain changed.
+     */
+    private boolean replacePlayers(final Set<UUID> incoming) {
+        boolean edited = false;
+        for (final UUID uniqueId : backing.getPlayers()) {
+            if (!incoming.contains(uniqueId)) {
+                backing.removePlayer(uniqueId);
+                edited = true;
+            }
+        }
+        for (final UUID uniqueId : incoming) {
+            if (!backing.containsPlayer(uniqueId)) {
+                backing.addPlayer(uniqueId);
+                edited = true;
+            }
+        }
+        return edited;
+    }
+
+    /**
+     * {@link #replacePlayers} for groups.
+     */
+    private boolean replaceGroups(final Set<String> incoming) {
+        boolean edited = false;
+        for (final String group : backing.getGroups()) {
+            if (!incoming.contains(group)) {
+                backing.removeGroup(group);
+                edited = true;
+            }
+        }
+        for (final String group : incoming) {
+            if (!backing.containsGroup(group)) {
+                backing.addGroup(group);
+                edited = true;
+            }
+        }
+        return edited;
     }
 
     private void changed() {

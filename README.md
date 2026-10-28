@@ -140,7 +140,13 @@ like.
 | `/wg menu [id]`                                              | Open the region browser, or one region's flag editor                        |
 | `/wg settings`                                               | Edit messages and cooldowns in-game                                         |
 | `/wg bypass`                                                 | Toggle your own bypass                                                      |
+| `/wg debug`                                                  | Toggle explanations: which flag refused you, and which region set it        |
 | `/wg reload`                                                 | Reload config and messages                                                  |
+| `/wg blacklist list [scope]`                                 | Show blacklist entries, `global` or one world's                             |
+| `/wg blacklist add <scope> <items>`                          | Add an entry for some items, comma-separated                                |
+| `/wg blacklist set <scope> <number> <option> [value]`        | Set or clear one option of an entry (`on-place`, `message`, …)              |
+| `/wg blacklist remove <scope> <number>`                      | Remove an entry                                                             |
+| `/wg blacklist whitelist <scope> <true\|false>`              | Turn whitelist mode on or off                                               |
 
 The spellings this replaced still work and always will, they are just kept out of the help so the list stays short:
 `define-cylinder`, `define-sphere`, `define-polygon` and their `redefine-` twins,
@@ -165,10 +171,18 @@ block or a wiki page, nothing needs changing.
 | `uworldguard.settings`         | `settings`                                        |
 | `uworldguard.reload`           | `reload`                                          |
 | `uworldguard.notify`           | See `notify-enter` / `notify-leave` announcements |
+| `uworldguard.blacklist`        | `blacklist` commands                              |
+| `uworldguard.blacklist.notify` | See blacklist `notify` announcements              |
+| `uworldguard.debug`            | `debug`                                           |
 | `uworldguard.bypass`           | Ignore region protection — **default: off**       |
 
 Every node except `uworldguard.bypass` defaults to operators. Commands you lack permission for
 don't appear in tab-completion.
+
+`/wg debug` is for working out why something was refused. While it is on, each refusal tells you which flag did it and
+why: the region that set it to deny (naming the parent when the value is inherited), or that the flag is unset and you
+are not a member of the region that decides. Blocked damage to you is explained the same way, and so is a pvp hit you
+threw that a region stopped. Each flag explains at most once a second, and debug turns itself off when you log out.
 
 ### Flags
 
@@ -195,9 +209,9 @@ Groups: `all` · `members` · `owners` · `nonmembers` · `nonowners` · `none`.
 WorldGuard's spellings work too, so `non-members` and `non_members` are both accepted.
 
 <details>
-<summary><b>Protection</b> — who can touch what (41 flags)</summary>
+<summary><b>Protection</b> — who can touch what (42 flags)</summary>
 
-`build` · `block-break` · `block-place` · `interact` · `use` · `chest-access` · `pvp` ·
+`build` · `block-break` · `block-place` · `break-placed-only` · `interact` · `use` · `chest-access` · `pvp` ·
 `damage-animals` · `fall-damage` · `ride` · `sleep` · `tnt` · `lighter` · `end-crystal-place` ·
 `end-crystal-interact` · `worldedit` · `pistons` · `passthrough` · `entity-item-frame-destroy` ·
 `entity-painting-destroy` · `entity-armor-stand-destroy` · `vehicle-place` · `vehicle-destroy` · `potion-splash` ·
@@ -214,6 +228,11 @@ flags existed are unaffected.
 
 `passthrough` is the odd one: it makes a region *not* apply protection, letting lower-priority
 regions decide instead.
+
+`break-placed-only` is for arenas. Set it to `allow` alongside `block-place allow` and `block-break allow`, and players
+can break only blocks a player placed in the region. The map itself survives, by hand and by explosion.
+`allow-block-break` still lets you name map blocks that stay breakable, like glass. Placed blocks are remembered in the
+chunk, so this survives restarts, and a block an arena reset put back counts as map again.
 </details>
 
 <details>
@@ -239,9 +258,9 @@ have PAPI installed — useful for gating on a level from another plugin.
 </details>
 
 <details>
-<summary><b>Mobs &amp; explosions</b> (21 flags)</summary>
+<summary><b>Mobs &amp; explosions</b> (22 flags)</summary>
 
-`mob-spawning` · `deny-spawn` · `mob-damage` · `creeper-explosion` · `other-explosion` ·
+`mob-spawning` · `deny-spawn` · `allow-entity-damage` · `mob-damage` · `creeper-explosion` · `other-explosion` ·
 `enderman-grief` · `ghast-fireball` · `wither-damage` · `enderdragon-block-damage` ·
 `ravager-grief` · `snowman-trails` · `breeze-charge-explosion` · `lightning` · `mob-drops` ·
 `exp-drops` · `raid` · `entity-transform` · `breed` · `tame` · `door-break` · `copper-golem`
@@ -252,6 +271,17 @@ building one (26.x); player-built golems are outside `mob-spawning` by design.
 `mob-spawning` is a blanket toggle over *natural* spawns. `deny-spawn` is a list of entity types
 that may never appear, whatever put them there — spawn egg, spawner, or another plugin:
 `/wg flag spawn deny-spawn CREEPER,minecraft:phantom`.
+
+`allow-entity-damage` is a list of entity types anyone may hit, even where they can't build and
+`damage-animals` is denied: `/wg flag spawn allow-entity-damage BAT,COD`.
+
+Harm stops at the claim border, as in WorldGuard. A blast, mob or bolt with no player behind it counts as a member of
+the claim it started in. It can break blocks and hurt animals, stands, frames and carts there, but not in a neighbouring
+claim. TNT counts from where it was primed, not where it landed. A blast someone lit only breaks blocks where that
+player can build.
+`block-break allow` opens a claim to every blast, and `tnt allow` opens it to TNT. The explosion flags are also checked
+where the victim stands, so a crystal or creeper at the edge of one region cannot hurt players in a neighbour that
+denies it.
 </details>
 
 <details>
@@ -316,12 +346,12 @@ for everyone else.
 </details>
 
 <details>
-<summary><b>Items &amp; commands</b> (23 flags)</summary>
+<summary><b>Items &amp; commands</b> (24 flags)</summary>
 
 `disable-completely` · `disable-throw` · `wind-charge` · `villager-trade` · `permit-workbenches` ·
 `inventory-craft` · `item-drop` · `item-pickup` · `deny-item-drops` · `deny-item-pickup` ·
 `item-durability` · `allow-block-place` · `deny-block-place` · `allow-block-break` ·
-`deny-block-break` · `blocked-cmds` · `allowed-cmds` · `crafter` · `hopper-transfer` ·
+`deny-block-break` · `allow-interact` · `blocked-cmds` · `allowed-cmds` · `crafter` · `hopper-transfer` ·
 `dispense` · `enchant` · `brew` · `smelt`
 
 `hopper-transfer` is judged at the destination, so it stops a hopper chain reaching under the
@@ -333,6 +363,14 @@ specific materials instead.
 The `allow-*` / `deny-*` block lists are the fine-grained escape hatch: `deny-block-break` blocks
 those materials **even for members**, and `allow-block-break` permits them **even for outsiders**.
 Handy for a survival spawn where anyone may harvest crops but nobody may break stone.
+
+`allow-interact` does the same for right-clicks: anyone may use the listed blocks, whatever
+`interact`, `use`, `chest-access`, `permit-workbenches` or the block's own flag says. Name the block as placed, so a
+wall sign is `OAK_WALL_SIGN` and a potted flower is `POTTED_POPPY`.
+
+```
+/wg flag spawn allow-interact FURNACE,SMITHING_TABLE,CRAFTING_TABLE
+```
 
 `blocked-cmds` is a deny-list. `allowed-cmds`, if you set it, is exclusive — anything not on the
 list is refused.
@@ -352,6 +390,15 @@ storage:
         enabled: true
         url: "jdbc:sqlite:plugins/uWorldGuard/regions.db"
 ```
+
+If the database can't be opened at startup, uWorldGuard disables itself instead of running unprotected on empty YAML
+files.
+
+On UniverseSpigot, uWorldGuard detects the server and keeps regions in its built-in region service:
+that service's files store them and its index answers lookups. Each world migrates automatically from the storage
+configured above the first time it loads there, and `universe-migrated.txt` lists the worlds that have moved. The
+configured storage keeps a full copy afterwards, since every save writes both, so moving back to Paper loses nothing. If
+the server's region service isn't available, uWorldGuard uses the configured storage as normal.
 
 **Movement detection.** This is the setting to reach for if your server is struggling.
 `PlayerMoveEvent` fires many times per second per player, and it's the most expensive thing any
@@ -430,6 +477,51 @@ The two add up — a block is exempt if either list names it. There's no way to 
 one world, so if only some worlds should allow it, put it in their lists rather than the global one. Apply changes with
 `/wg reload`.
 
+**Blacklist.** Restrict items and blocks everywhere, inside regions or not, the way WorldGuard's blacklist does. Each
+entry names some items and says what happens for each thing a player might do with them:
+
+```yaml
+blacklist:
+    use-as-whitelist: false
+    logging:
+        console: true
+        file: true          # plugins/uWorldGuard/logs/blacklist-<date>.log
+    entries:
+        -   items: [ lava_bucket, water_bucket ]
+            ignore-perms: [ spawn.builder ]
+            ignore-groups: [ admin ]
+            on-use: [ deny, tell, log ]
+            message: "<red>No buckets here."
+        -   items: [ tnt ]
+            on-place: [ deny, notify, kick ]
+            comment: "TNT"
+```
+
+| Rule              | When                                                   |
+|-------------------|--------------------------------------------------------|
+| `on-break`        | Breaking the block                                     |
+| `on-place`        | Placing the block, or pouring the fluid from a bucket  |
+| `on-interact`     | Right-clicking or stepping on the block                |
+| `on-use`          | Right-clicking with the item, or eating or drinking it |
+| `on-drop`         | Dropping the item                                      |
+| `on-acquire`      | Picking it up or taking it from an inventory           |
+| `on-equip`        | Putting it on as armour                                |
+| `on-destroy-with` | Breaking any block while holding it                    |
+| `on-dispense`     | A dispenser firing it                                  |
+
+Actions are `deny`, `allow`, `tell` (tell the player), `notify` (staff with `uworldguard.blacklist.notify`), `log`,
+`kick` and `ban`. `ignore-groups` is checked as the `group.<name>` permission, which LuckPerms grants to members. A
+player is told, notified about and logged at most once per rule every three seconds, but refused every time. Picking
+items up is refused silently, and as in WorldGuard, an `on-acquire` item clicked or scrolled to in the player's own
+inventory is taken away.
+
+Entries under `blacklist` apply in every world. A world's own entries go under `worlds.<name>.blacklist.entries` and add
+to them, and `worlds.<name>.blacklist.use-as-whitelist` overrides the mode for that world. Whitelist mode works as
+WorldGuard's does: a listed item is refused for every rule that doesn't say `allow`, and unlisted items are left alone.
+
+Edit it in game with `/wg blacklist`, which applies changes at once and saves `config.yml`, or edit the file and run
+`/wg reload`.
+
 ### Messages
 
 `messages.yml` controls what players are told. Every entry is MiniMessage, and every entry can be
@@ -458,7 +550,7 @@ The two levels disable independently — a per-flag `false` silences only that f
 `no-permission` silences everything that has no override of its own. `cooldown-seconds` stops the
 same message repeating at a player who's spam-clicking.
 
-Flags that can send a denial: `block-break`, `block-place`, `interact`, `chest-access`,
+Flags that can send a denial: `block-break`, `block-place`, `break-placed-only`, `interact`, `chest-access`,
 `end-crystal-place`, `end-crystal-interact`, `villager-trade`, `permit-workbenches`,
 `inventory-craft`, `disable-completely`, `disable-throw`, `deny-item-drops`, `blocked-cmds`.
 
@@ -501,9 +593,10 @@ plugins, …) link against a bundled compatibility layer that answers with uWorl
   `getPlugin("WorldGuard")` resolves to uWorldGuard.
 - **Version checks:** a plugin that gates its WorldGuard hook on a version string starting with `7` would decline to
   hook against a 1.x plugin, even though the API is present, and Paper attaches no version to a *provided* plugin name.
-  So uWorldGuard publishes the WorldGuard API level it implements (`7.0.18`) in place of its own version. It is one
-  field per plugin, so it is all-or-nothing: `/version` reports it too. uWorldGuard's own log lines, its update check
-  and bStats keep using the real version. PvPManager and BetonQuest are two that need this; set
+  So uWorldGuard publishes the WorldGuard API level it implements (`7.0.18`) in place of its own version, through the
+  legacy `getDescription()` those plugins read. The Paper plugin metadata keeps the real version, so spark shows it.
+  uWorldGuard's own log lines, its update check and bStats use the real version too. PvPManager and BetonQuest are two
+  that need this; set
   `compatibility.report-version` to `none` in `config.yml` to publish the real version instead, or to a version of your
   own. A few plugins read the version out of `plugin.yml` in the jar rather than from the plugin metadata, which a
   `paper-plugin.yml` plugin does not ship; uWorldGuard answers that read with a WorldGuard descriptor carrying the same
@@ -717,15 +810,15 @@ thread. The player and the region are safe to touch there; anything else needs a
 Every deliberate edit to a region fires a cancellable event before it is applied, so a plugin can veto one without
 intercepting commands or reaching in with reflection:
 
-| Event                         | Fired before                                   | Extra                                     |
-|-------------------------------|------------------------------------------------|-------------------------------------------|
-| `RegionCreateEvent`           | a region is added                              | the region, not yet in the world          |
-| `RegionRedefineEvent`         | a region is reshaped                           | `getReplacement()`, the new shape         |
-| `RegionRemoveEvent`           | a region is removed                            | last chance to read it                    |
-| `RegionFlagChangeEvent`       | a flag is set, cleared, or narrowed to a group | `getFlag()`, old/new value, old/new group |
-| `RegionPriorityChangeEvent`   | a priority changes                             | `getOldPriority()`, `getNewPriority()`    |
-| `RegionParentChangeEvent`     | a parent is set, changed or cleared            | `getOldParent()`, `getNewParent()`        |
-| `RegionMembershipChangeEvent` | an owner or member is added or removed         | `getRole()`, `getPlayer()`, `isAdding()`  |
+| Event                         | Fired before                                   | Extra                                                    |
+|-------------------------------|------------------------------------------------|----------------------------------------------------------|
+| `RegionCreateEvent`           | a region is added                              | the region, not yet in the world                         |
+| `RegionRedefineEvent`         | a region is reshaped                           | `getReplacement()`, the new shape                        |
+| `RegionRemoveEvent`           | a region is removed                            | last chance to read it                                   |
+| `RegionFlagChangeEvent`       | a flag is set, cleared, or narrowed to a group | `getFlag()`, old/new value, old/new group                |
+| `RegionPriorityChangeEvent`   | a priority changes                             | `getOldPriority()`, `getNewPriority()`                   |
+| `RegionParentChangeEvent`     | a parent is set, changed or cleared            | `getOldParent()`, `getNewParent()`                       |
+| `RegionMembershipChangeEvent` | an owner or member is added or removed         | `getRole()`, `getPlayer()` or `getGroup()`, `isAdding()` |
 
 ```java
 
@@ -775,6 +868,13 @@ or anything else that disables a plugin before loading its replacement. The relo
 every region gets its values back. Plugins using the WorldGuard API get the same treatment, and their session handlers
 are unregistered along with their flags, so a reload never leaves two copies of a handler running.
 
+uWorldGuard itself can be swapped with Cork too (`/cork reload uWorldGuard`). A plugin built against uWorldGuard or the
+WorldGuard API stays linked to the copy it loaded with, so uWorldGuard disables those plugins first, and the new copy
+reloads them through Cork once it is up. That covers plugins that depend or soft-depend on WorldGuard or uWorldGuard,
+plugins that registered flags or session handlers, and anything depending on those. Without Cork they stay disabled and
+the log names them. The first swap from a release older than this one only reloads the plugins that declare a
+dependency, so restart for that upgrade if a plugin uses the API without declaring it.
+
 Flag types available: `StateFlag` (allow/deny + group), `BooleanFlag`, `IntegerFlag`, `DoubleFlag`,
 `StringFlag`, `StringSetFlag`, `MaterialSetFlag`, `PotionEffectSetFlag`. Subclass `Flag<T>` for
 anything else — you implement `parse`, `marshal` and `unmarshal`.
@@ -785,8 +885,15 @@ hashing. A flag re-registered after its plugin reloads gets its old index back.
 ### Region types
 
 `ProtectedCuboidRegion`, `ProtectedCylinderRegion`, `ProtectedSphereRegion`,
-`ProtectedPolygonRegion`, and `GlobalProtectedRegion` (a whole world, priority-wise below
-everything). All extend `ProtectedRegion`. Get a world's `RegionManager` from
+`ProtectedPolygonRegion`, and `GlobalProtectedRegion` (a whole world, priority-wise below everything). Three more match
+the shapes UniverseSpigot has:
+
+- `ProtectedPolyhedronRegion`: the convex hull of a set of points, up to 1,000,000 blocks on each axis.
+- `ProtectedCompositeRegion`: named parts under one id. A block is inside if any part holds it.
+- `ProtectedCarvedRegion`: a solid with named holes cut out. A block in a hole is not in the region.
+
+Parts and holes are ordinary regions used for their shape only, and can nest. All of these extend
+`ProtectedRegion`. Get a world's `RegionManager` from
 `RegionContainer.get(world)` — it returns `null` if that world's regions aren't loaded, so check.
 
 ### Threading

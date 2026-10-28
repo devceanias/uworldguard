@@ -2,6 +2,7 @@ package com.tricrotism.uworldguard.listeners;
 
 import com.tricrotism.uworldguard.config.EventGate;
 import com.tricrotism.uworldguard.flags.Flags;
+import com.tricrotism.uworldguard.region.ApplicableRegionSet;
 import com.tricrotism.uworldguard.region.RegionQuery;
 import com.tricrotism.uworldguard.text.MessageService;
 import com.tricrotism.uworldguard.util.Locations;
@@ -35,11 +36,12 @@ public final class DeathListener implements Listener {
             return;
         }
         final Player victim = event.getEntity();
-        if (Boolean.TRUE.equals(query.queryValue(victim, Flags.KEEP_INVENTORY))) {
+        final ApplicableRegionSet set = query.getApplicableRegions(victim);
+        if (Boolean.TRUE.equals(set.queryValue(Flags.KEEP_INVENTORY))) {
             event.setKeepInventory(true);
             event.getDrops().clear();
         }
-        if (Boolean.TRUE.equals(query.queryValue(victim, Flags.KEEP_EXP))) {
+        if (Boolean.TRUE.equals(set.queryValue(Flags.KEEP_EXP))) {
             event.setKeepLevel(true);
             event.setDroppedExp(0);
         }

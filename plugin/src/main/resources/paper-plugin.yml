@@ -47,8 +47,17 @@ permissions:
     uworldguard.compat:
         description: View WorldGuard API compatibility layer diagnostics (/uwg compat).
         default: op
+    uworldguard.debug:
+        description: See which flag refused you and which region set it (/uwg debug).
+        default: op
     uworldguard.notify:
         description: Receive notify-enter / notify-leave announcements.
+        default: op
+    uworldguard.blacklist:
+        description: View and edit the blacklist in game (/uwg blacklist).
+        default: op
+    uworldguard.blacklist.notify:
+        description: Receive blacklist notify announcements.
         default: op
     uworldguard.menu:
         description: Open the region browser and per-region flag editor.

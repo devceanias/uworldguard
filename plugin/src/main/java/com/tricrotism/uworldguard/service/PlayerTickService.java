@@ -3,6 +3,7 @@ package com.tricrotism.uworldguard.service;
 import com.tricrotism.uworldguard.flags.Flags;
 import com.tricrotism.uworldguard.region.ApplicableRegionSet;
 import com.tricrotism.uworldguard.region.RegionContainerImpl;
+import com.tricrotism.uworldguard.region.RegionManager;
 import com.tricrotism.uworldguard.region.RegionQuery;
 import com.tricrotism.uworldguard.wgcompat.SessionDispatch;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
@@ -35,8 +36,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * health and potion API are only ever touched on the entity's region thread. Region flag reads go
  * through the thread-safe {@link RegionQuery}. The tick is skipped when no region on the server uses
  * any of these flags, and each half is skipped per-world via
- * {@link ApplicableRegionSet#worldUses} — except that a player still holding effects this service
- * granted keeps ticking the effect half until they are stripped.
+ * {@link ApplicableRegionSet#worldUses}, except that a player still holding effects or a sky lock
+ * this service applied keeps ticking that half until it is undone, so changing world or deleting the
+ * last region using the flag cannot strand it.
  */
 @NullMarked
 public final class PlayerTickService implements Listener {
@@ -51,9 +53,10 @@ public final class PlayerTickService implements Listener {
 
     /**
      * What this service last gave {@code player}: the flag value it came from, so an unchanged set is
-     * recognized by identity, and the types it applied, so walking out strips exactly those.
+     * recognized by identity, the types it applied, so walking out strips exactly those, and the
+     * effects it built, which the periodic refresh re-sends as they are.
      */
-    private record Granted(Set<PotionEffect> source, Set<PotionEffectType> types) {}
+    private record Granted(Set<PotionEffect> source, Set<PotionEffectType> types, List<PotionEffect> applied) {}
 
     /**
      * The time and weather overrides last pushed to a player, as the raw flag values. Held so the
@@ -102,7 +105,9 @@ public final class PlayerTickService implements Listener {
                 && !container.anyRegionUses(Flags.TIME_LOCK)
                 && !container.anyRegionUses(Flags.WEATHER_LOCK)
                 && !container.anyRegionUses(Flags.GIVE_EFFECTS)
-                && !container.anyRegionUses(Flags.BLOCKED_EFFECTS)) {
+                && !container.anyRegionUses(Flags.BLOCKED_EFFECTS)
+                && !skyLocks.containsKey(uuid)
+                && !granted.containsKey(uuid)) {
                 return;
             }
             apply(player, seconds.incrementAndGet(), sessions);
@@ -155,6 +160,19 @@ public final class PlayerTickService implements Listener {
         if (sessions) {
             SessionDispatch.tick(player);
         }
+        // Healing a player on the death screen leaves them stuck, since vanilla will not respawn
+        // anyone above 0 health.
+        if (player.isDead()) {
+            return;
+        }
+        final UUID id = player.getUniqueId();
+        final RegionManager world = container.get(player.getWorld());
+        if (world != null && !skyLocks.containsKey(id) && !granted.containsKey(id)
+            && !world.anyRegionUses(Flags.HEAL_AMOUNT) && !world.anyRegionUses(Flags.FEED_AMOUNT)
+            && !world.anyRegionUses(Flags.TIME_LOCK) && !world.anyRegionUses(Flags.WEATHER_LOCK)
+            && !world.anyRegionUses(Flags.GIVE_EFFECTS) && !world.anyRegionUses(Flags.BLOCKED_EFFECTS)) {
+            return;
+        }
         final ApplicableRegionSet regions = query.getApplicableRegions(player);
         if (regions.worldUses(Flags.HEAL_AMOUNT) && due(tick, regions.queryValue(Flags.HEAL_DELAY))) {
             heal(player, regions);
@@ -162,7 +180,8 @@ public final class PlayerTickService implements Listener {
         if (regions.worldUses(Flags.FEED_AMOUNT) && due(tick, regions.queryValue(Flags.FEED_DELAY))) {
             feed(player, regions);
         }
-        if (regions.worldUses(Flags.TIME_LOCK) || regions.worldUses(Flags.WEATHER_LOCK)) {
+        if (regions.worldUses(Flags.TIME_LOCK) || regions.worldUses(Flags.WEATHER_LOCK)
+            || skyLocks.containsKey(player.getUniqueId())) {
             lockSky(player, regions);
         }
         if (regions.worldUses(Flags.GIVE_EFFECTS) || regions.worldUses(Flags.BLOCKED_EFFECTS)
@@ -182,54 +201,52 @@ public final class PlayerTickService implements Listener {
 
     /**
      * Applies time-lock / weather-lock client-side, so one player standing in an eternal-night arena
-     * does not change the sky for the whole server. Both reset the moment the flag stops applying,
-     * which is why the reset runs even when the value is absent.
+     * does not change the sky for the whole server. Each half is touched only when its value changed,
+     * and resets the moment its flag stops applying, so a half this service never set (weather another
+     * plugin gave the player, say) is left alone.
      */
     private void lockSky(final Player player, final ApplicableRegionSet regions) {
         final UUID id = player.getUniqueId();
         final String time = regions.queryValue(Flags.TIME_LOCK);
         final String weather = regions.queryValue(Flags.WEATHER_LOCK);
         final SkyLock applied = skyLocks.get(id);
-        if (time == null && weather == null) {
-            if (applied == null) {
-                return;
-            }
-            skyLocks.remove(id);
-            if (applied.time() != null) {
+        final boolean timeChanged = !Objects.equals(applied == null ? null : applied.time(), time);
+        final boolean weatherChanged = !Objects.equals(applied == null ? null : applied.weather(), weather);
+        if (!timeChanged && !weatherChanged) {
+            return;
+        }
+
+        if (timeChanged) {
+            if (time == null) {
                 player.resetPlayerTime();
+            } else {
+                final Long ticks = parseTime(time);
+                if (ticks != null) {
+                    player.setPlayerTime(ticks, false);
+                }
             }
-            if (applied.weather() != null) {
+        }
+
+        if (weatherChanged) {
+            if (weather == null) {
                 player.resetPlayerWeather();
-            }
-            return;
-        }
-        if (applied != null && Objects.equals(applied.time(), time)
-            && Objects.equals(applied.weather(), weather)) {
-            return;
-        }
-
-        if (time == null) {
-            player.resetPlayerTime();
-        } else {
-            final Long ticks = parseTime(time);
-            if (ticks != null) {
-                player.setPlayerTime(ticks, false);
+            } else {
+                final WeatherType type = switch (weather.trim().toLowerCase(Locale.ROOT)) {
+                    case "clear", "sun", "sunny" -> WeatherType.CLEAR;
+                    case "downfall", "rain", "storm", "thunder" -> WeatherType.DOWNFALL;
+                    default -> null;
+                };
+                if (type != null) {
+                    player.setPlayerWeather(type);
+                }
             }
         }
 
-        if (weather == null) {
-            player.resetPlayerWeather();
+        if (time == null && weather == null) {
+            skyLocks.remove(id);
         } else {
-            final WeatherType type = switch (weather.trim().toLowerCase(Locale.ROOT)) {
-                case "clear", "sun", "sunny" -> WeatherType.CLEAR;
-                case "downfall", "rain", "storm", "thunder" -> WeatherType.DOWNFALL;
-                default -> null;
-            };
-            if (type != null) {
-                player.setPlayerWeather(type);
-            }
+            skyLocks.put(id, new SkyLock(time, weather));
         }
-        skyLocks.put(id, new SkyLock(time, weather));
     }
 
     private static @Nullable Long parseTime(final String raw) {
@@ -326,11 +343,20 @@ public final class PlayerTickService implements Listener {
                     player.removePotionEffect(type);
                 }
             }
-        } else if (previous == null || previous.source() != give || tick % REAPPLY_SECONDS == 0L) {
+        } else if (previous != null && previous.source() == give) {
+            if (tick % REAPPLY_SECONDS == 0L) {
+                for (final PotionEffect effect : previous.applied()) {
+                    player.addPotionEffect(effect);
+                }
+            }
+        } else {
             final Set<PotionEffectType> current = new HashSet<>(Math.max(4, give.size() * 2));
+            final List<PotionEffect> applied = new ArrayList<>(give.size());
             for (final PotionEffect effect : give) {
-                player.addPotionEffect(new PotionEffect(
-                    effect.getType(), REAPPLY_TICKS, effect.getAmplifier(), true, false, false));
+                final PotionEffect refreshed = new PotionEffect(
+                    effect.getType(), REAPPLY_TICKS, effect.getAmplifier(), true, false, false);
+                player.addPotionEffect(refreshed);
+                applied.add(refreshed);
                 current.add(effect.getType());
             }
             if (previous != null) {
@@ -340,7 +366,7 @@ public final class PlayerTickService implements Listener {
                     }
                 }
             }
-            granted.put(id, new Granted(give, current));
+            granted.put(id, new Granted(give, current, applied));
         }
 
         final Set<PotionEffect> blocked = regions.queryValue(Flags.BLOCKED_EFFECTS);

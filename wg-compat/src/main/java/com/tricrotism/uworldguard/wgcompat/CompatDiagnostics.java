@@ -13,18 +13,43 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.LongAdder;
 
 /**
- * Counters behind {@code /uwg compat}. Hot-path cost is a single {@link LongAdder#increment()};
- * the per-method stub map is only touched on cold (stubbed) paths.
+ * Counters behind {@code /uwg compat}. The three a consumer can hit per event are {@link Tally}s and
+ * the rest are {@link LongAdder}s. The per-method stub map is only touched on cold (stubbed) paths.
  */
 @NullMarked
 public final class CompatDiagnostics {
 
-    public static final LongAdder QUERIES = new LongAdder();
-    public static final LongAdder REGION_READS = new LongAdder();
+    public static final Tally QUERIES = new Tally();
+    public static final Tally REGION_READS = new Tally();
     public static final LongAdder REGION_MUTATIONS = new LongAdder();
     public static final LongAdder WRAPS = new LongAdder();
     public static final LongAdder FLAG_REGISTRATIONS = new LongAdder();
-    public static final LongAdder SESSION_DISPATCHES = new LongAdder();
+    public static final Tally SESSION_DISPATCHES = new Tally();
+
+    /**
+     * A count for paths a consumer can hit on every event, without the compare-and-swap
+     * {@link LongAdder} pays per add. Each add is a plain write to a slot picked by thread, one slot
+     * per cache line, so two threads on one slot can lose a count and an unlocked sum can trail the
+     * writes. That is fine for numbers that only say how busy the layer is.
+     */
+    public static final class Tally {
+        private static final int SLOTS = 32;
+        private static final int STRIDE = 8;
+        private final long[] counts = new long[SLOTS * STRIDE];
+
+        public void increment() {
+            counts[(int) (Thread.currentThread().threadId() & (SLOTS - 1)) * STRIDE]++;
+        }
+
+        public long sum() {
+            long total = 0;
+            for (int i = 0; i < counts.length; i += STRIDE) {
+                total += counts[i];
+            }
+            return total;
+        }
+    }
+
     public static final LongAdder EVENTS_FIRED = new LongAdder();
     public static final LongAdder FLAG_PARSE_FAILURES = new LongAdder();
 

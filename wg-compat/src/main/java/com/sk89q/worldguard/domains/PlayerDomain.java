@@ -14,8 +14,8 @@ import java.util.UUID;
  * The player half of a {@link DefaultDomain}: a live view of the UUID set inside a uWorldGuard
  * {@code com.tricrotism.uworldguard.domain.DefaultDomain}.
  *
- * <p>When this view belongs to a region, every mutation marks that region's world dirty, because
- * engine domain edits do not persist by themselves.
+ * <p>When this view belongs to a region, every edit that changes it marks that region's world dirty,
+ * because engine domain edits do not persist by themselves.
  */
 public class PlayerDomain implements Domain, ChangeTracked {
 
@@ -64,6 +64,9 @@ public class PlayerDomain implements Domain, ChangeTracked {
     }
 
     public void addPlayer(final UUID uniqueId) {
+        if (backing.containsPlayer(uniqueId)) {
+            return;
+        }
         backing.addPlayer(uniqueId);
         changed();
     }
@@ -83,6 +86,9 @@ public class PlayerDomain implements Domain, ChangeTracked {
     }
 
     public void removePlayer(final UUID uuid) {
+        if (!backing.containsPlayer(uuid)) {
+            return;
+        }
         backing.removePlayer(uuid);
         changed();
     }
@@ -130,7 +136,11 @@ public class PlayerDomain implements Domain, ChangeTracked {
 
     @Override
     public void clear() {
-        for (final UUID uniqueId : backing.getPlayers()) {
+        final Set<UUID> players = backing.getPlayers();
+        if (players.isEmpty()) {
+            return;
+        }
+        for (final UUID uniqueId : players) {
             backing.removePlayer(uniqueId);
         }
         changed();

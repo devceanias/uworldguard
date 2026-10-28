@@ -11,7 +11,7 @@ import org.jspecify.annotations.NullMarked;
 import org.jspecify.annotations.Nullable;
 
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.*;
 import java.util.function.Consumer;
 import java.util.logging.Level;
 
@@ -27,10 +27,11 @@ public final class RegionContainerImpl implements RegionContainer {
     /**
      * A loaded world's regions together with the name they persist under. The name is held rather
      * than resolved: the autosave runs on the async scheduler, and {@code Bukkit.getWorld(uid)} walks
-     * the server's world map, which is not concurrent — a world loading or unloading mid-sweep could
-     * take the save down with a {@code ConcurrentModificationException}.
+     * the server's world map, which is not concurrent. A world loading or unloading mid-sweep could
+     * take the save down with a {@code ConcurrentModificationException}. The world is held so
+     * {@link #get} can find it by reference. Nothing calls into it off its thread.
      */
-    private record Loaded(String name, RegionManager manager) {}
+    private record Loaded(World world, String name, RegionManager manager) {}
 
     private final Plugin plugin;
     private final RegionStore store;
@@ -42,6 +43,11 @@ public final class RegionContainerImpl implements RegionContainer {
      * array allocates nothing.
      */
     private volatile RegionManager[] managers = new RegionManager[0];
+    /**
+     * {@link #loaded} again, for {@link #get} to scan by reference. Every query resolves its world
+     * first, and comparing a handful of references is cheaper than hashing a UUID.
+     */
+    private volatile Loaded[] byWorld = new Loaded[0];
     private final Set<String> failedLoads = ConcurrentHashMap.newKeySet();
     /**
      * Worlds whose async populate is still in flight. The publish at the end of {@link #load} claims
@@ -70,6 +76,19 @@ public final class RegionContainerImpl implements RegionContainer {
      */
     private static final int STORE_LOCKS = 16;
     private final Object[] storeLocks = newStoreLocks();
+    /**
+     * Each unloaded world's save, by name, until it has finished. A load of the same name waits for
+     * it, and the shutdown save waits for all of them, since the stripe lock alone serializes the two
+     * but does not decide which goes first.
+     */
+    private final Map<String, CompletableFuture<Void>> unloadSaves = new ConcurrentHashMap<>();
+    /**
+     * True until the server's first tick. This plugin enables at {@code STARTUP}, before any world
+     * exists, so every startup world arrives through {@link #load}. Those load in place, the way
+     * {@link #loadAll} does: spawn preparation and plugins enabling after the worlds query them before
+     * an async load could finish, and blocking startup costs only a moment.
+     */
+    private volatile boolean starting = true;
 
     private static Object[] newStoreLocks() {
         final Object[] locks = new Object[STORE_LOCKS];
@@ -95,9 +114,10 @@ public final class RegionContainerImpl implements RegionContainer {
      * the I/O costs a moment of startup and nothing else — whereas loading these asynchronously left
      * a window where {@link #get} answered "no manager" for a world that has regions, and
      * {@code RegionQuery} cannot tell that apart from wilderness. Worlds that appear later go through
-     * {@link #load}, which has no such luxury.
+     * {@link #load}, which loads in place too until the server's first tick.
      */
     public void loadAll() {
+        plugin.getServer().getGlobalRegionScheduler().run(plugin, _ -> starting = false);
         for (final World world : Bukkit.getWorlds()) {
             final RegionManager manager = new RegionManager();
             final String name = world.getName();
@@ -114,7 +134,8 @@ public final class RegionContainerImpl implements RegionContainer {
                 manager.addRegion(new GlobalProtectedRegion());
             }
             manager.clearDirty();
-            loaded.put(world.getUID(), new Loaded(name, manager));
+            manager.uwgUseIndex(store.index(name, manager));
+            loaded.put(world.getUID(), new Loaded(world, name, manager));
             republishManagers();
             warnAboutUnenforcedGroups(name, manager);
             Bukkit.getPluginManager().callEvent(new RegionsLoadedEvent(world, manager));
@@ -129,14 +150,17 @@ public final class RegionContainerImpl implements RegionContainer {
      * latency on a world loaded into a running server — in which every lookup answered "no regions
      * here", which listeners cannot tell apart from wilderness. For that window the world read as
      * completely unprotected. Until the load finishes {@link #get} returns {@code null}, which is the
-     * "not loaded" answer callers already handle.
+     * "not loaded" answer callers already handle. While the server is still starting the load runs in
+     * place instead, so there is no such window for startup worlds.
+     *
+     * <p>A world unloaded a moment ago is read only once its unload save has written.
      */
     public RegionManager load(final World world) {
         final RegionManager manager = new RegionManager();
         final String name = world.getName();
         final UUID uid = world.getUID();
         loading.add(uid);
-        plugin.getServer().getAsyncScheduler().runNow(plugin, task -> {
+        final Runnable populate = () -> {
             try {
                 synchronized (storeLock(name)) {
                     store.load(name, manager);
@@ -154,12 +178,21 @@ public final class RegionContainerImpl implements RegionContainer {
             if (!loading.remove(uid)) {
                 return;
             }
-            loaded.put(uid, new Loaded(name, manager));
+            manager.uwgUseIndex(store.index(name, manager));
+            loaded.put(uid, new Loaded(world, name, manager));
             republishManagers();
             FlagLifecycle.resolvePending(manager);
             warnAboutUnenforcedGroups(name, manager);
             Bukkit.getPluginManager().callEvent(new RegionsLoadedEvent(world, manager));
-        });
+        };
+        final CompletableFuture<Void> unloadSave = unloadSaves.get(name);
+        if (unloadSave != null) {
+            unloadSave.whenComplete((_, _) -> plugin.getServer().getAsyncScheduler().runNow(plugin, _ -> populate.run()));
+        } else if (starting) {
+            populate.run();
+        } else {
+            plugin.getServer().getAsyncScheduler().runNow(plugin, _ -> populate.run());
+        }
         return manager;
     }
 
@@ -192,14 +225,43 @@ public final class RegionContainerImpl implements RegionContainer {
         }
     }
 
+    /**
+     * Saves the world's regions off-thread, then lets the store drop the world. Dropping it first
+     * cost the universe store its record of what was already saved, so the unload save resent every
+     * region and refilled that record for a world nobody manages any more.
+     */
     public void unload(final World world) {
         loading.remove(world.getUID());
         final Loaded removed = loaded.remove(world.getUID());
         republishManagers();
-        if (removed != null) {
-            Bukkit.getPluginManager().callEvent(new RegionsUnloadedEvent(world, removed.manager()));
-            saveAsync(removed.name(), removed.manager(), () -> {});
+        if (removed == null) {
+            return;
         }
+        final String name = removed.name();
+        final RegionManager manager = removed.manager();
+        Bukkit.getPluginManager().callEvent(new RegionsUnloadedEvent(world, manager));
+        final CompletableFuture<Void> done = new CompletableFuture<>();
+        unloadSaves.put(name, done);
+        plugin.getServer().getAsyncScheduler().runNow(plugin, _ -> {
+            try {
+                synchronized (storeLock(name)) {
+                    if (failedLoads.contains(name)) {
+                        plugin.getLogger().warning("Skipping region save for world " + name
+                            + ": its regions failed to load and saving would overwrite the stored data.");
+                    } else {
+                        store.save(name, manager);
+                    }
+                }
+            } catch (final Exception e) {
+                plugin.getLogger().log(Level.WARNING, "Failed to save regions for world " + name, e);
+            } finally {
+                synchronized (storeLock(name)) {
+                    store.unload(name);
+                }
+                unloadSaves.remove(name, done);
+                done.complete(null);
+            }
+        });
     }
 
     /**
@@ -209,7 +271,7 @@ public final class RegionContainerImpl implements RegionContainer {
         loaded.forEach((_, world) -> {
             final RegionManager manager = world.manager();
             if (manager.clearDirty()) {
-                saveAsync(world.name(), manager, manager::markDirty);
+                saveAsync(world.name(), manager, manager::uwgMarkUnsaved);
             }
         });
     }
@@ -240,7 +302,8 @@ public final class RegionContainerImpl implements RegionContainer {
                         }
 
                         manager.clearDirty();
-                        loaded.put(uid, new Loaded(name, manager));
+                        manager.uwgUseIndex(store.index(name, manager));
+                        loaded.put(uid, new Loaded(previous.world(), name, manager));
 
                         republishManagers();
 
@@ -250,6 +313,8 @@ public final class RegionContainerImpl implements RegionContainer {
                     FlagLifecycle.resolvePending(manager);
 
                     warnAboutUnenforcedGroups(name, manager);
+
+                    Bukkit.getPluginManager().callEvent(new RegionsLoadedEvent(previous.world(), manager));
 
                     count++;
                 } catch (final Exception e) {
@@ -293,8 +358,24 @@ public final class RegionContainerImpl implements RegionContainer {
 
     /**
      * Persist every world synchronously — for plugin shutdown, where the async scheduler is stopping.
+     * Unload saves still running are waited for first, up to {@code waitSeconds} in total, so none of
+     * them writes after the store closes.
      */
-    public void saveAllBlocking() {
+    public void saveAllBlocking(final int waitSeconds) {
+        final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(waitSeconds);
+        for (final Map.Entry<String, CompletableFuture<Void>> entry : unloadSaves.entrySet()) {
+            try {
+                entry.getValue().get(Math.max(0L, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+            } catch (final TimeoutException e) {
+                plugin.getLogger().warning("Gave up waiting for the unload save of world " + entry.getKey()
+                    + " after " + waitSeconds + " seconds.");
+            } catch (final InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            } catch (final ExecutionException e) {
+                plugin.getLogger().log(Level.WARNING, "Unload save of world " + entry.getKey() + " failed", e);
+            }
+        }
         loaded.forEach((_, world) -> {
             final String name = world.name();
             if (failedLoads.contains(name)) {
@@ -343,6 +424,12 @@ public final class RegionContainerImpl implements RegionContainer {
 
     @Override
     public @Nullable RegionManager get(final World world) {
+        final Loaded[] snapshot = byWorld;
+        for (int i = 0; i < snapshot.length; i++) {
+            if (snapshot[i].world() == world) {
+                return snapshot[i].manager();
+            }
+        }
         final Loaded found = loaded.get(world.getUID());
         return found == null ? null : found.manager();
     }
@@ -379,11 +466,13 @@ public final class RegionContainerImpl implements RegionContainer {
      * loads and unloads are rare enough that rebuilding beats keeping the two in step incrementally.
      */
     private void republishManagers() {
-        final List<RegionManager> snapshot = new ArrayList<>(loaded.size());
-        for (final Loaded world : loaded.values()) {
-            snapshot.add(world.manager());
+        final List<Loaded> worlds = new ArrayList<>(loaded.values());
+        final RegionManager[] snapshot = new RegionManager[worlds.size()];
+        for (int i = 0; i < snapshot.length; i++) {
+            snapshot[i] = worlds.get(i).manager();
         }
-        managers = snapshot.toArray(new RegionManager[0]);
+        managers = snapshot;
+        byWorld = worlds.toArray(new Loaded[0]);
     }
 
     @Override
